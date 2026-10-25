@@ -1,0 +1,9 @@
+# Normalize line endings across platforms (Windows + WSL).
+* text=auto
+
+# Explicitly binary.
+*.png binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
