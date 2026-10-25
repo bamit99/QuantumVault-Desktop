@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use windows::Win32::Storage::FileSystem::{
-    SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+    FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW,
 };
 use windows::core::HSTRING;
 
@@ -29,7 +29,10 @@ pub fn apply(path: &Path) -> std::io::Result<()> {
     std::fs::write(path.join(ICON_NAME), ICON_BYTES)?;
     std::fs::write(path.join("desktop.ini"), DESKTOP_INI)?;
 
-    set_attr(&path.join("desktop.ini"), FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN);
+    set_attr(
+        &path.join("desktop.ini"),
+        FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN,
+    );
     set_attr(&path.join(ICON_NAME), FILE_ATTRIBUTE_HIDDEN);
     // The folder itself needs the System attribute for Explorer to read desktop.ini.
     set_attr(path, FILE_ATTRIBUTE_SYSTEM);
@@ -37,10 +40,7 @@ pub fn apply(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_attr(
-    path: &Path,
-    flags: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
-) {
+fn set_attr(path: &Path, flags: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES) {
     let ws = HSTRING::from(path.to_string_lossy().as_ref());
     // SAFETY: `ws` is a valid null-terminated wide string describing a path we
     // just created. Best-effort — ignore failures (e.g. on non-Windows targets).

@@ -8,8 +8,8 @@
 //! moved between vaults, file IDs, or purposes (audit finding QV-04).
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, Nonce, Payload},
     Aes256Gcm,
+    aead::{Aead, KeyInit, Nonce, Payload},
 };
 
 use super::error::{CryptoError, Result};
@@ -63,13 +63,7 @@ pub fn decrypt(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> 
     let nonce =
         Nonce::<Aes256Gcm>::try_from(iv).map_err(|e| CryptoError::InvalidFormat(e.to_string()))?;
     cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: ct,
-                aad,
-            },
-        )
+        .decrypt(&nonce, Payload { msg: ct, aad })
         .map_err(|_| CryptoError::AuthenticationFailed)
 }
 

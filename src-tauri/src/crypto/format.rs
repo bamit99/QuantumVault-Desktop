@@ -160,30 +160,29 @@ pub fn decrypt_file(
     let payload_aad = build_aad(PURPOSE_PAYLOAD, ctx);
 
     // Leg 1: device keys.
-    if let Some(privk) = device_priv {
-        if let Ok(kek) = kem::decapsulate(privk, &fields.eph_pub, &fields.encapsulation, &fields.salt)
-        {
-            if let Ok(fk) = aead::decrypt(&kek, &fields.wrapped_device, &keywrap_aad) {
-                let file_key: [u8; FILE_KEY_LEN] = fk
-                    .try_into()
-                    .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
-                let file_key = zeroize::Zeroizing::new(file_key);
-                if let Ok(pt) = aead::decrypt(&file_key, &fields.payload, &payload_aad) {
-                    return Ok(pt);
-                }
-            }
+    if let Some(privk) = device_priv
+        && let Ok(kek) =
+            kem::decapsulate(privk, &fields.eph_pub, &fields.encapsulation, &fields.salt)
+        && let Ok(fk) = aead::decrypt(&kek, &fields.wrapped_device, &keywrap_aad)
+    {
+        let file_key: [u8; FILE_KEY_LEN] = fk
+            .try_into()
+            .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
+        let file_key = zeroize::Zeroizing::new(file_key);
+        if let Ok(pt) = aead::decrypt(&file_key, &fields.payload, &payload_aad) {
+            return Ok(pt);
         }
     }
 
     // Leg 2: passphrase (cross-device recovery path).
-    if let Some(pass_kek) = pass_kek {
-        if let Ok(fk) = aead::decrypt(pass_kek, &fields.wrapped_pass, &keywrap_aad) {
-            let file_key: [u8; FILE_KEY_LEN] = fk
-                .try_into()
-                .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
-            let file_key = zeroize::Zeroizing::new(file_key);
-            return aead::decrypt(&file_key, &fields.payload, &payload_aad);
-        }
+    if let Some(pass_kek) = pass_kek
+        && let Ok(fk) = aead::decrypt(pass_kek, &fields.wrapped_pass, &keywrap_aad)
+    {
+        let file_key: [u8; FILE_KEY_LEN] = fk
+            .try_into()
+            .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
+        let file_key = zeroize::Zeroizing::new(file_key);
+        return aead::decrypt(&file_key, &fields.payload, &payload_aad);
     }
 
     Err(CryptoError::AuthenticationFailed)
@@ -208,6 +207,11 @@ pub fn has_magic(blob: &[u8]) -> bool {
 fn parse(blob: &[u8]) -> Result<Parsed> {
     if !has_magic(blob) {
         return Err(CryptoError::InvalidFormat("not a QVAULT blob".into()));
+    }
+    // The magic alone (6 bytes) must not index the version byte: a truncated
+    // blob is untrusted input. (Found by the robustness/fuzz tests.)
+    if blob.len() < MAGIC.len() + 1 {
+        return Err(CryptoError::InvalidFormat("blob too short".into()));
     }
     let mut off = MAGIC.len();
     let version = blob[off];
@@ -325,7 +329,15 @@ mod tests {
         let pass_kek = test_pass_kek(b"pass");
         let blob = encrypt_file(b"secret", &pubk, &pass_kek, &ctx("vault-A", "file-1")).unwrap();
 
-        assert!(decrypt_file(&blob, Some(&privk), Some(&pass_kek), &ctx("vault-B", "file-1")).is_err());
+        assert!(
+            decrypt_file(
+                &blob,
+                Some(&privk),
+                Some(&pass_kek),
+                &ctx("vault-B", "file-1")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -351,6 +363,24 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 0x01;
         assert!(decrypt_file(&blob, Some(&privk), None, &c).is_err());
+    }
+
+    #[test]
+    fn magic_only_blob_does_not_panic() {
+        // Regression: a blob that is exactly the magic used to index past the
+        // end while reading the version byte (found by the robustness tests).
+        let pass_kek = test_pass_kek(b"pass");
+        let c = ctx("v", "f");
+        assert!(matches!(
+            decrypt_file(MAGIC, None, Some(&pass_kek), &c),
+            Err(CryptoError::InvalidFormat(_))
+        ));
+        // Every prefix short of the full header must be rejected cleanly.
+        let pubk = kem::generate_keypair().public();
+        let full = encrypt_file(b"x", &pubk, &pass_kek, &c).unwrap();
+        for len in 0..HEADER_LEN.min(64) {
+            let _ = decrypt_file(&full[..len], None, Some(&pass_kek), &c);
+        }
     }
 
     #[test]

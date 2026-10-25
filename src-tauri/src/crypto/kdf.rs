@@ -55,9 +55,26 @@ pub fn derive(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
 /// Common/compromised substrings that make a passphrase guessable regardless
 /// of length (QV2-07). Checked case-insensitively.
 const WEAK_PATTERNS: &[&str] = &[
-    "password", "passphrase", "letmein", "welcome", "iloveyou", "admin",
-    "qwerty", "asdf", "zxcv", "1234", "abcd", "monkey", "dragon", "football",
-    "master", "login", "secret", "changeme", "trustno1", "sunshine",
+    "password",
+    "passphrase",
+    "letmein",
+    "welcome",
+    "iloveyou",
+    "admin",
+    "qwerty",
+    "asdf",
+    "zxcv",
+    "1234",
+    "abcd",
+    "monkey",
+    "dragon",
+    "football",
+    "master",
+    "login",
+    "secret",
+    "changeme",
+    "trustno1",
+    "sunshine",
 ];
 
 /// Strength assessment shared by the UI and the backend policy.

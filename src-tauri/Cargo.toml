@@ -3,6 +3,10 @@ name = "quantum-vault-desktop"
 version = "0.1.2"
 description = "Post-quantum encrypted file vault for Windows (ML-KEM-768 + X25519 hybrid)"
 authors = ["Amit Bhatnagar"]
+# Source-available, free for personal use; commercial use requires permission.
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/bamit99/QuantumVault-Desktop"
+homepage = "https://www.linkedin.com/in/amitxbhatnagar/"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

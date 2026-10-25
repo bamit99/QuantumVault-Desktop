@@ -8,6 +8,8 @@ mod folder_icon;
 mod manifest;
 mod paths;
 mod registry;
+#[cfg(test)]
+mod robustness;
 mod session;
 mod vault;
 
@@ -108,11 +110,7 @@ fn create_vault(
 }
 
 #[tauri::command]
-fn open_vault(
-    state: State<AppState>,
-    path: String,
-    passphrase: String,
-) -> Result<String, String> {
+fn open_vault(state: State<AppState>, path: String, passphrase: String) -> Result<String, String> {
     let pb = zeroize::Zeroizing::new(passphrase.into_bytes());
     let vault = Vault::open(Path::new(&path), &pb).map_err(|e| e.to_string())?;
     let key = norm_key(&path);
@@ -208,7 +206,9 @@ fn passphrase_strength(passphrase: String) -> Option<&'static str> {
 
 #[tauri::command]
 fn list_files(state: State<AppState>, vault: String) -> Result<Vec<FileEntry>, String> {
-    with_session(&state, &vault, |s| s.list_files().map_err(|e| e.to_string()))
+    with_session(&state, &vault, |s| {
+        s.list_files().map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]
@@ -281,18 +281,20 @@ fn extract_file_to(
         // and refuse to overwrite an existing file. Path checks alone are not
         // enough: a pre-existing symlink under the destination could redirect a
         // lexically-valid relative path outside the chosen directory.
-        let (dest, mut file) = crate::paths::create_file_nofollow(Path::new(&dest_dir), &entry.name)
-            .map_err(|e| e.to_string())?;
+        let (dest, mut file) =
+            crate::paths::create_file_nofollow(Path::new(&dest_dir), &entry.name)
+                .map_err(|e| e.to_string())?;
         std::io::Write::write_all(&mut file, &data).map_err(|e| format!("write file: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("sync file: {e}"))?;
+        file.sync_all().map_err(|e| format!("sync file: {e}"))?;
         Ok(dest.to_string_lossy().to_string())
     })
 }
 
 #[tauri::command]
 fn delete_file(state: State<AppState>, vault: String, id: String) -> Result<(), String> {
-    with_session(&state, &vault, |s| s.delete_file(&id).map_err(|e| e.to_string()))
+    with_session(&state, &vault, |s| {
+        s.delete_file(&id).map_err(|e| e.to_string())
+    })
 }
 
 #[tauri::command]

@@ -13,8 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::error::{CryptoError, Result};
@@ -134,7 +134,6 @@ impl VaultMeta {
         }
         Ok(pass_kek)
     }
-
 }
 
 /// An open (unlocked) vault.
@@ -191,9 +190,9 @@ impl Vault {
             version: META_VERSION,
             vault_id: vault_id.clone(),
             mlkem_pub_b64: STANDARD.encode(&pubk.mlkem),
-            x25519_pub_b64: STANDARD.encode(&pubk.x25519),
+            x25519_pub_b64: STANDARD.encode(pubk.x25519),
             sealed_priv_b64: STANDARD.encode(&sealed),
-            verify_salt_b64: STANDARD.encode(&kdf::new_salt()?),
+            verify_salt_b64: STANDARD.encode(kdf::new_salt()?),
             verifier_b64: String::new(),
         };
 
@@ -236,7 +235,9 @@ impl Vault {
             )));
         }
         if meta.vault_id.is_empty() {
-            return Err(CryptoError::InvalidFormat("vault.meta has no vault ID".into()));
+            return Err(CryptoError::InvalidFormat(
+                "vault.meta has no vault ID".into(),
+            ));
         }
 
         let pass_kek = meta.derive_pass_kek(passphrase)?;
@@ -503,7 +504,7 @@ mod tests {
         // Attacker keypair.
         let attacker = kem::generate_keypair().public();
         meta.mlkem_pub_b64 = STANDARD.encode(&attacker.mlkem);
-        meta.x25519_pub_b64 = STANDARD.encode(&attacker.x25519);
+        meta.x25519_pub_b64 = STANDARD.encode(attacker.x25519);
         std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
 
         let err = Vault::open(&path, PASS);

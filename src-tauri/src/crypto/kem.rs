@@ -13,8 +13,8 @@
 
 use hkdf::Hkdf;
 use ml_kem::{
-    kem::{self, Decapsulate, Encapsulate, Kem, Key, KeyExport, KeyInit},
     MlKem768,
+    kem::{self, Decapsulate, Encapsulate, Kem, Key, KeyExport, KeyInit},
 };
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
@@ -70,8 +70,7 @@ impl VaultPrivate {
         let sk = StaticSecret::from(*self.x25519);
         let x_pub = PublicKey::from(&sk).to_bytes();
         // ML-KEM public key is derivable from the private key via the KEM trait.
-        let dk = mlkem_dk_from_bytes(&self.mlkem)
-            .expect("stored ML-KEM private key must be valid");
+        let dk = mlkem_dk_from_bytes(&self.mlkem).expect("stored ML-KEM private key must be valid");
         VaultPublic {
             mlkem: dk.encapsulation_key().to_bytes().to_vec(),
             x25519: x_pub,

@@ -12,9 +12,9 @@ use zeroize::Zeroizing;
 
 use crate::crypto::error::{CryptoError, Result};
 use crate::crypto::{self, format, kem};
-use crate::manifest::{hex, FileEntry, Manifest};
+use crate::manifest::{FileEntry, Manifest, hex};
 use crate::paths;
-use crate::vault::{write_atomic, Vault, MANIFEST_FILENAME};
+use crate::vault::{MANIFEST_FILENAME, Vault, write_atomic};
 
 /// The `.qvault` file extension.
 const FILE_EXT: &str = "qvault";
@@ -150,7 +150,8 @@ impl Session {
         let blob = std::fs::read(self.file_path(id)?)
             .map_err(|e| CryptoError::Other(format!("read encrypted file: {e}")))?;
         let ctx = self.ctx(id);
-        let data = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
+        let data =
+            format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
         Ok((entry, Zeroizing::new(data)))
     }
 
@@ -161,9 +162,7 @@ impl Session {
 
         // Refuse unknown IDs before touching either the manifest or the disk.
         if manifest.get(id).is_none() {
-            return Err(CryptoError::InvalidFormat(format!(
-                "no such file: {id}"
-            )));
+            return Err(CryptoError::InvalidFormat(format!("no such file: {id}")));
         }
         let blob_path = self.file_path(id)?;
 
@@ -197,20 +196,23 @@ impl Session {
         if !path.exists() {
             return Ok(Manifest::new());
         }
-        let blob = std::fs::read(&path)
-            .map_err(|e| CryptoError::Other(format!("read manifest: {e}")))?;
+        let blob =
+            std::fs::read(&path).map_err(|e| CryptoError::Other(format!("read manifest: {e}")))?;
         let ctx = self.ctx(format::MANIFEST_CONTEXT);
-        let json = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
+        let json =
+            format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
         let manifest: Manifest = serde_json::from_slice(&json)
             .map_err(|e| CryptoError::InvalidFormat(format!("parse manifest: {e}")))?;
 
         // QV2-01: an encrypted manifest can still carry attacker-chosen data, so
         // validate every ID and name at parse time - not only on UI actions.
         for entry in &manifest.files {
-            paths::validate_file_id(&entry.id)
-                .map_err(|_| CryptoError::InvalidFormat("manifest contains an invalid file id".into()))?;
-            paths::validate_relative(&entry.name)
-                .map_err(|_| CryptoError::InvalidFormat("manifest contains an unsafe file name".into()))?;
+            paths::validate_file_id(&entry.id).map_err(|_| {
+                CryptoError::InvalidFormat("manifest contains an invalid file id".into())
+            })?;
+            paths::validate_relative(&entry.name).map_err(|_| {
+                CryptoError::InvalidFormat("manifest contains an unsafe file name".into())
+            })?;
         }
         Ok(manifest)
     }
@@ -322,7 +324,13 @@ mod tests {
 
         session.rename_file(&b.id, "renamed.json").unwrap();
         assert_eq!(
-            session.list_files().unwrap().iter().find(|f| f.id == b.id).unwrap().name,
+            session
+                .list_files()
+                .unwrap()
+                .iter()
+                .find(|f| f.id == b.id)
+                .unwrap()
+                .name,
             "renamed.json"
         );
 
@@ -355,7 +363,8 @@ mod tests {
         assert_eq!(n, 3, "symlink must be skipped");
 
         let files = session.list_files().unwrap();
-        let names: std::collections::HashSet<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> =
+            files.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("root.txt"));
         assert!(names.contains("sub/a.txt"));
         assert!(names.contains("sub/deep/b.txt"));
@@ -424,7 +433,10 @@ mod tests {
         let mut manifest = session.load_manifest().unwrap();
         manifest.get_mut(&e.id).unwrap().id = "../../evil".to_string();
         session.save_manifest(&manifest).unwrap();
-        assert!(session.list_files().is_err(), "manifest with bad id must not load");
+        assert!(
+            session.list_files().is_err(),
+            "manifest with bad id must not load"
+        );
 
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -478,7 +490,8 @@ mod tests {
 
         // Simulate an over-limit length without allocating 1 GiB: check the guard
         // logic directly through a small helper boundary.
-        assert!(MAX_FILE_BYTES >= 64 * 1024 * 1024);
+        // Guard the interim control remains meaningfully large.
+        const _: () = assert!(MAX_FILE_BYTES >= 64 * 1024 * 1024);
         let small = vec![0u8; 32 * 1024];
         assert!(session.add_file("small.bin", &small).is_ok());
 

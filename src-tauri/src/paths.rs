@@ -113,7 +113,10 @@ pub fn validate_file_id(id: &str) -> Result<()> {
             id.len()
         )));
     }
-    if !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err(CryptoError::InvalidFormat(
             "invalid file id: must be lowercase hexadecimal".into(),
         ));
@@ -224,12 +227,12 @@ pub fn create_file_nofollow(base: &Path, rel: &str) -> Result<(PathBuf, std::fs:
         .open(&dest)
     {
         Ok(f) => Ok((dest, f)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(CryptoError::Other(
-            format!(
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(CryptoError::Other(format!(
                 "a file already exists at '{}' — refusing to overwrite",
                 dest.display()
-            ),
-        )),
+            )))
+        }
         Err(e) => Err(CryptoError::Other(format!(
             "create {}: {e}",
             dest.display()
@@ -296,14 +299,26 @@ mod tests {
     #[test]
     fn rejects_traversal() {
         for bad_name in ["..", ".", "../outside.txt", "a/../../b"] {
-            assert!(validate_basename(bad_name).is_err(), "{bad_name} should fail");
+            assert!(
+                validate_basename(bad_name).is_err(),
+                "{bad_name} should fail"
+            );
         }
     }
 
     #[test]
     fn rejects_separators_and_absolute() {
-        for bad_name in ["a/b", "a\\b", "/etc/passwd", "C:\\evil", "\\\\server\\share"] {
-            assert!(validate_basename(bad_name).is_err(), "{bad_name} should fail");
+        for bad_name in [
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "C:\\evil",
+            "\\\\server\\share",
+        ] {
+            assert!(
+                validate_basename(bad_name).is_err(),
+                "{bad_name} should fail"
+            );
         }
     }
 
@@ -366,11 +381,14 @@ mod tests {
             "C:\\evil",
             "",
             "abc",
-            "0123456789abcdef0123456789ABCDEF", // uppercase
-            "0123456789abcdef0123456789abcdeg", // non-hex
+            "0123456789abcdef0123456789ABCDEF",  // uppercase
+            "0123456789abcdef0123456789abcdeg",  // non-hex
             "0123456789abcdef0123456789abcdef0", // too long
         ] {
-            assert!(validate_file_id(bad_id).is_err(), "id '{bad_id}' must be rejected");
+            assert!(
+                validate_file_id(bad_id).is_err(),
+                "id '{bad_id}' must be rejected"
+            );
         }
     }
 
