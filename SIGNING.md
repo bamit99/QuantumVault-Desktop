@@ -45,21 +45,32 @@ EKU (`1.3.6.1.5.5.7.3.3`). The private key stays in
 
 ### Sign a build
 
+Signing is wired into bundling via `bundle.windows.signCommand` in
+`src-tauri/tauri.conf.json`, so `npm run tauri build` signs automatically:
+
 ```powershell
-npm run tauri build -- --no-bundle   # or the full build
-npm run sign
+npm run tauri build
 ```
 
-`sign.ps1` will:
+`scripts/sign-one.ps1` is invoked by the bundler for every binary it produces and
+signs each one with SHA-256 plus an RFC 3161 timestamp (falling back to no
+timestamp when offline).
 
-- locate the newest SDK `signtool.exe`,
-- resolve the thumbprint from `certs\thumbprint.txt` (or `-Thumbprint`),
-- sign with SHA-256 and an RFC 3161 timestamp (falls back to unsigned-timestamp
-  if the timestamp server is unreachable),
-- verify the result.
+**Ordering matters.** The bundler rewrites the main executable to embed a
+bundle-type marker *before* creating each installer, which invalidates any
+signature already applied. That is why signing must happen *during* bundling:
+the exe embedded in the NSIS/MSI installers is signed at that point.
 
-`npm run tauri build` does not sign automatically — run `npm run sign` after it,
-or wire it into your release script.
+The standalone portable `quantum-vault-desktop.exe` is re-patched by the final
+bundler pass, so sign it once more afterwards:
+
+```powershell
+npm run sign        # or: scripts\sign-one.ps1 -File <path-to-exe>
+```
+
+If no certificate exists (fresh clone, CI without secrets), `sign-one.ps1` warns
+and exits 0 so the build still succeeds unsigned. Set
+`QUANTUMVAULT_REQUIRE_SIGNING=1` to make a missing certificate a hard failure.
 
 ### CI / another machine
 
