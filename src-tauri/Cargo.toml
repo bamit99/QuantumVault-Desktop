@@ -1,6 +1,6 @@
 [package]
 name = "quantum-vault-desktop"
-version = "0.1.2"
+version = "0.1.3"
 description = "Post-quantum encrypted file vault for Windows (ML-KEM-768 + X25519 hybrid)"
 authors = ["Amit Bhatnagar"]
 # Source-available, free for personal use; commercial use requires permission.

@@ -144,6 +144,31 @@ This is a **heuristic, not an entropy estimator**. A passphrase of common words
 chosen by a person can still be weak. Prefer a randomly generated multi-word
 passphrase.
 
+## Verification
+
+Run before each release:
+
+```bash
+cd src-tauri
+cargo test          # 74 tests
+cargo clippy --all-targets
+cargo fmt --check
+cargo deny check    # advisories, licences, bans, sources
+cargo audit
+npm audit
+```
+
+`cargo deny` is scoped to the shipped Windows target (`deny.toml`), so warnings
+about Linux-only transitive crates do not mask anything in the actual binary.
+`cargo audit` may still report Linux-only crates (D-Bus/`rfd`); confirm with
+`cargo tree -i <crate> --target x86_64-pc-windows-msvc`, which prints nothing
+when the crate is not in the Windows graph.
+
+`src/robustness.rs` provides deterministic fuzz-style tests (seeded RNG, no
+nightly required): random and mutated blobs through the parser, random strings
+through the path validators, and a containment check on random extraction names.
+Coverage-guided fuzzing with `cargo-fuzz` remains recommended as a further step.
+
 ## Reporting
 
 Security issues: [Amit Bhatnagar](https://www.linkedin.com/in/amitxbhatnagar/).
