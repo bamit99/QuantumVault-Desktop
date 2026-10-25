@@ -1,0 +1,46 @@
+[package]
+name = "quantum-vault-desktop"
+version = "0.1.0"
+description = "Post-quantum encrypted file vault for Windows (ML-KEM-768 + X25519 hybrid)"
+authors = ["Amit Bhatnagar"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "quantum_vault_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ml-kem = { version = "0.3.3", features = ["getrandom"] }
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "getrandom"] }
+argon2 = "0.6.0"
+aes-gcm = "0.11.1"
+hkdf = "0.13.0"
+sha2 = "0.11.1"
+zeroize = { version = "1.9.1", features = ["derive"] }
+rand = "0.10.3"
+base64 = "0.23.1"
+rfd = "0.17.2"
+getrandom = "0.4.3"
+windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+tauri-plugin-dialog = "2.8.3"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

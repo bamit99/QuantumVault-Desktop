@@ -1,0 +1,103 @@
+# Quantum Vault — Desktop
+
+<p align="center">
+  <img src="src-tauri/icons/icon.png" alt="Quantum Vault" width="128" />
+</p>
+
+**Post-quantum encrypted file vault for Windows.** Encrypt files into any
+cloud-synced folder — Google Drive, OneDrive, Dropbox — so they're stored as
+opaque ciphertext that syncs to the cloud automatically. No OAuth, no cloud API:
+the provider never sees anything readable.
+
+<p align="center">
+  <img src="assets/screenshot.png" alt="Quantum Vault screenshot" width="720" />
+</p>
+
+---
+
+## Why post-quantum?
+
+Most file encryption is vulnerable to **"harvest now, decrypt later"** — an
+attacker stores your ciphertext today and decrypts it once a large-scale quantum
+computer exists. Quantum Vault uses a **hybrid KEM** so that even a quantum
+computer cannot recover your files:
+
+| Layer | Primitive | Role |
+|---|---|---|
+| Post-quantum KEM | **ML-KEM-768** (FIPS 203) | Quantum-resistant key encapsulation |
+| Classical KEM | **X25519** | Fast, widely-trusted ECDH |
+| Key derivation | **Argon2id** (256 MiB) | Memory-hard passphrase hashing |
+| File encryption | **AES-256-GCM** | Authenticated confidentiality |
+
+The file key is wrapped by **both** legs — an attacker must break *both* the
+lattice problem *and* the elliptic-curve problem to recover anything.
+
+## How it works
+
+1. **Create a vault** — pick a cloud folder and a passphrase. The app creates an
+   encrypted vault folder inside it.
+2. **Add files or folders** — each file is encrypted with a fresh 256-bit key,
+   wrapped by the hybrid KEM *and* your passphrase. Original names and metadata
+   are hidden inside the ciphertext (on-disk names are random).
+3. **Sync** — your cloud client (Drive/OneDrive/Dropbox) syncs the ciphertext as
+   ordinary opaque files.
+4. **Unlock anywhere** — the same passphrase unlocks the vault on any machine
+   (cross-device recovery), while the device key (sealed with Windows **DPAPI**)
+   still protects at rest.
+
+## Features
+
+- 🔐 **ML-KEM-768 + X25519 hybrid** key encapsulation
+- 📁 Encrypt **entire folders** recursively (structure preserved)
+- 👁️ **In-app preview** of images and text without extracting
+- 🧠 **Multiple vaults** — each with its own passphrase and lock state
+- 🟢 **Availability check** — shows whether a vault's folder is still present
+- 🏷️ **Custom folder icon** — the vault folder shows a distinct icon in Explorer
+- 🖥️ **Modern, custom UI** — dark theme, no stock Windows chrome
+
+## Getting started (development)
+
+Prerequisites: [Rust](https://rustup.rs) (MSVC toolchain), [Node.js](https://nodejs.org) ≥ 18,
+and [WebView2](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on Windows 10/11).
+
+```bash
+git clone https://github.com/bamit99/QuantumVault-Desktop.git
+cd QuantumVault-Desktop
+npm install
+npm run tauri dev
+```
+
+## Build an installer
+
+```bash
+npm run tauri build
+```
+
+The bundled installer is written to `src-tauri/target/release/bundle/`.
+
+## Architecture
+
+- **Frontend:** React 19 + TypeScript + Vite 8 + Tailwind CSS 4 + Motion
+- **Backend:** Rust (Tauri 2), with `ml-kem`, `x25519-dalek`, `argon2`, `aes-gcm`
+- **Key storage:** device private keys sealed with Windows DPAPI
+
+```
+src-tauri/src/
+├── crypto/     # aead (AES-GCM), kdf (Argon2id), kem (hybrid), format, dpapi
+├── vault.rs    # vault lifecycle (create / open / unlock)
+├── manifest.rs # encrypted file index
+├── session.rs  # unlocked-session file operations
+└── registry.rs # persisted list of known vaults
+```
+
+> ⚠️ **No recovery.** Your passphrase is never stored or recoverable. If you lose
+> it, your files are gone. The `vault.meta` file is essential — deleting it makes
+> the vault permanently unreadable.
+
+## Author
+
+Built by [Amit Bhatnagar](https://www.linkedin.com/in/amitxbhatnagar/).
+
+## License
+
+Free for personal use. See [LICENSE](LICENSE.md) for terms.
