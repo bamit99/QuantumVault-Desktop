@@ -7,3 +7,8 @@
 *.icns binary
 *.woff binary
 *.woff2 binary
+
+# Windows scripts must check out with CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf

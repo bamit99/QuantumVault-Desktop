@@ -105,6 +105,15 @@ src-tauri/src/
 Please read [SECURITY.md](SECURITY.md) before storing sensitive data. It documents
 the threat model, the key-wrapping trade-offs, and current limits.
 
+## Code signing
+
+The released binaries are signed with a self-signed certificate. See
+[SIGNING.md](SIGNING.md) to verify the signature or trust the certificate.
+
+```powershell
+Get-AuthenticodeSignature .\quantum-vault-desktop.exe | Format-List Status, SignerCertificate
+```
+
 ## Author
 
 Built by [Amit Bhatnagar](https://www.linkedin.com/in/amitxbhatnagar/).
