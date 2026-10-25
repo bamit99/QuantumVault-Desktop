@@ -10,8 +10,36 @@ opaque ciphertext that syncs to the cloud automatically. No OAuth, no cloud API:
 the provider never sees anything readable.
 
 <p align="center">
+  <a href="https://github.com/bamit99/QuantumVault-Desktop/releases/latest"><img src="https://img.shields.io/github/v/release/bamit99/QuantumVault-Desktop?label=release" alt="Latest release" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6" alt="Platform" />
+  <img src="https://img.shields.io/badge/tests-57%20passing-brightgreen" alt="Tests" />
+</p>
+
+<p align="center">
   <img src="assets/screenshot.png" alt="Quantum Vault screenshot" width="720" />
 </p>
+
+---
+
+## Download
+
+Grab the latest build from **[Releases](https://github.com/bamit99/QuantumVault-Desktop/releases/latest)**:
+
+| File | Use it if you want |
+|---|---|
+| `quantum-vault-desktop.exe` | **Portable** — double-click and run, nothing installed |
+| `Quantum.Vault_<ver>_x64-setup.exe` | **Installer** — Start Menu shortcut + uninstaller |
+| `Quantum.Vault_<ver>_x64_en-US.msi` | **MSI** — managed/silent deployment |
+| `quantum-vault-codesign.cer` | Trust the publisher — see [SIGNING.md](SIGNING.md) |
+
+**Requirements:** Windows 10 or 11. WebView2 is preinstalled on both; nothing else
+(Node, Rust, a browser) is needed. The app is a native `.exe` — the UI runs in an
+embedded WebView2, so there is no server and no URL.
+
+> Signed with a self-signed certificate. On a machine that has not trusted the
+> certificate, Windows shows the standard SmartScreen prompt
+> (**More info → Run anyway**). Importing `quantum-vault-codesign.cer` removes it
+> and shows the verified publisher name.
 
 ---
 
@@ -73,13 +101,23 @@ npm install
 npm run tauri dev
 ```
 
-## Build an installer
+## Build from source
 
 ```bash
-npm run tauri build
+npm run tauri build      # produces the portable exe + NSIS and MSI installers
+npm run sign             # signs the portable exe (see SIGNING.md)
 ```
 
-The bundled installer is written to `src-tauri/target/release/bundle/`.
+Outputs:
+
+```
+src-tauri/target/release/quantum-vault-desktop.exe        # portable
+src-tauri/target/release/bundle/nsis/*-setup.exe          # NSIS installer
+src-tauri/target/release/bundle/msi/*.msi                 # MSI
+```
+
+Installers are signed during bundling. The standalone exe is re-patched by the
+final bundler pass, so it is signed afterwards by `npm run sign`.
 
 ## Architecture
 
@@ -89,11 +127,13 @@ The bundled installer is written to `src-tauri/target/release/bundle/`.
 
 ```
 src-tauri/src/
-├── crypto/     # aead (AES-GCM), kdf (Argon2id), kem (hybrid), format, dpapi
-├── vault.rs    # vault lifecycle (create / open / unlock)
-├── manifest.rs # encrypted file index
-├── session.rs  # unlocked-session file operations
-└── registry.rs # persisted list of known vaults
+├── crypto/        # aead (AES-GCM+AAD), kdf (Argon2id), kem (hybrid), format, dpapi
+├── paths.rs       # filename/path validation, link detection
+├── vault.rs       # vault lifecycle (create / open / unlock)
+├── manifest.rs    # encrypted file index
+├── session.rs     # unlocked-session file operations
+├── registry.rs    # persisted list of known vaults
+└── folder_icon.rs # desktop.ini custom folder icon
 ```
 
 > ⚠️ **No recovery.** Your passphrase is never stored or recoverable. If you lose
