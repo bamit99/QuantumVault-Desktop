@@ -6,6 +6,7 @@
 mod crypto;
 mod folder_icon;
 mod manifest;
+mod paths;
 mod registry;
 mod session;
 mod vault;
@@ -88,7 +89,8 @@ fn create_vault(
     path: String,
     passphrase: String,
 ) -> Result<String, String> {
-    let pb = passphrase.into_bytes();
+    // QV-05: hold the passphrase in a buffer we can zeroize.
+    let pb = zeroize::Zeroizing::new(passphrase.into_bytes());
     let vault = Vault::create(Path::new(&path), &pb).map_err(|e| e.to_string())?;
     let key = norm_key(&path);
 
@@ -111,7 +113,7 @@ fn open_vault(
     path: String,
     passphrase: String,
 ) -> Result<String, String> {
-    let pb = passphrase.into_bytes();
+    let pb = zeroize::Zeroizing::new(passphrase.into_bytes());
     let vault = Vault::open(Path::new(&path), &pb).map_err(|e| e.to_string())?;
     let key = norm_key(&path);
 
@@ -222,6 +224,16 @@ fn add_file_from_path(
             .and_then(|n| n.to_str())
             .unwrap_or("file")
             .to_string();
+        // QV-01: validate the basename before it enters the manifest.
+        crate::paths::validate_basename(&name).map_err(|e| e.to_string())?;
+        let meta = std::fs::metadata(p).map_err(|e| format!("stat file: {e}"))?;
+        if meta.len() > crate::session::MAX_FILE_BYTES {
+            return Err(format!(
+                "file too large: {} bytes (limit {} bytes)",
+                meta.len(),
+                crate::session::MAX_FILE_BYTES
+            ));
+        }
         let data = std::fs::read(p).map_err(|e| format!("read file: {e}"))?;
         s.add_file(&name, &data).map_err(|e| e.to_string())
     })
@@ -250,7 +262,7 @@ fn extract_file(
                 id: entry.id,
                 name: entry.name,
                 mime: entry.mime,
-                data,
+                data: data.to_vec(),
             })
             .map_err(|e| e.to_string())
     })
@@ -265,11 +277,13 @@ fn extract_file_to(
 ) -> Result<String, String> {
     with_session(&state, &vault, |s| {
         let (entry, data) = s.extract_file(&id).map_err(|e| e.to_string())?;
-        let dest = Path::new(&dest_dir).join(&entry.name);
+        // QV-01: validate the name and assert containment before writing.
+        let dest = crate::paths::safe_join(Path::new(&dest_dir), &entry.name)
+            .map_err(|e| e.to_string())?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create dirs: {e}"))?;
         }
-        std::fs::write(&dest, &data).map_err(|e| format!("write file: {e}"))?;
+        std::fs::write(&dest, &*data).map_err(|e| format!("write file: {e}"))?;
         Ok(dest.to_string_lossy().to_string())
     })
 }

@@ -1,9 +1,14 @@
 //! AES-256-GCM authenticated encryption helpers.
 //!
-//! Wire convention matches the Android app: `iv (12 B) ‖ ciphertext ‖ tag (16 B)`.
+//! Wire convention: `iv (12 B) ‖ ciphertext ‖ tag (16 B)`.
+//!
+//! Every operation is bound to caller-supplied **associated data (AAD)**, which
+//! commits the ciphertext to its context (purpose, format version, vault ID and
+//! file ID). Without the correct AAD, decryption fails — so a blob cannot be
+//! moved between vaults, file IDs, or purposes (audit finding QV-04).
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, Nonce},
+    aead::{Aead, KeyInit, Nonce, Payload},
     Aes256Gcm,
 };
 
@@ -16,15 +21,21 @@ pub const IV_LEN: usize = 12;
 /// GCM authentication tag length (bytes).
 pub const TAG_LEN: usize = 16;
 
-/// Encrypt `plaintext` under `key`, returning `iv ‖ ciphertext ‖ tag`.
-pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| CryptoError::Primitive(e.to_string()))?;
+/// Encrypt `plaintext` under `key` with `aad`, returning `iv ‖ ciphertext ‖ tag`.
+pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Primitive(e.to_string()))?;
     let iv: [u8; IV_LEN] = super::random()?;
     let nonce = Nonce::<Aes256Gcm>::from(iv);
 
     let mut ct = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Primitive("AES-GCM encrypt failed".into()))?;
 
     let mut out = Vec::with_capacity(IV_LEN + ct.len());
@@ -33,12 +44,13 @@ pub fn encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decrypt `blob` (format `iv ‖ ciphertext ‖ tag`) under `key`.
+/// Decrypt `blob` (`iv ‖ ciphertext ‖ tag`) under `key` with `aad`.
 ///
 /// # Errors
-/// [`CryptoError::AuthenticationFailed`] if the tag does not verify (wrong key
-/// or tampered data), or [`CryptoError::InvalidFormat`] if the blob is too short.
-pub fn decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
+/// [`CryptoError::AuthenticationFailed`] if the tag does not verify (wrong key,
+/// wrong AAD, or tampered data), or [`CryptoError::InvalidFormat`] if the blob is
+/// too short.
+pub fn decrypt(key: &[u8; KEY_LEN], blob: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < IV_LEN + TAG_LEN {
         return Err(CryptoError::InvalidFormat(format!(
             "ciphertext too short: {} bytes",
@@ -46,12 +58,18 @@ pub fn decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let (iv, ct) = blob.split_at(IV_LEN);
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| CryptoError::Primitive(e.to_string()))?;
-    let nonce = Nonce::<Aes256Gcm>::try_from(iv)
-        .map_err(|e| CryptoError::InvalidFormat(e.to_string()))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| CryptoError::Primitive(e.to_string()))?;
+    let nonce =
+        Nonce::<Aes256Gcm>::try_from(iv).map_err(|e| CryptoError::InvalidFormat(e.to_string()))?;
     cipher
-        .decrypt(&nonce, ct)
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ct,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::AuthenticationFailed)
 }
 
@@ -63,25 +81,24 @@ mod tests {
     fn round_trip() {
         let key = [9u8; KEY_LEN];
         let pt = b"the quick brown fox jumps over the lazy dog";
-        let ct = encrypt(&key, pt).unwrap();
+        let ct = encrypt(&key, pt, b"ctx").unwrap();
         assert_ne!(&ct[..pt.len()], pt);
-        let back = decrypt(&key, &ct).unwrap();
-        assert_eq!(back, pt);
+        assert_eq!(decrypt(&key, &ct, b"ctx").unwrap(), pt);
     }
 
     #[test]
     fn iv_is_random_per_call() {
         let key = [9u8; KEY_LEN];
-        let a = encrypt(&key, b"same").unwrap();
-        let b = encrypt(&key, b"same").unwrap();
+        let a = encrypt(&key, b"same", b"").unwrap();
+        let b = encrypt(&key, b"same", b"").unwrap();
         assert_ne!(&a[..IV_LEN], &b[..IV_LEN]);
     }
 
     #[test]
     fn wrong_key_fails_auth() {
-        let ct = encrypt(&[1u8; KEY_LEN], b"secret").unwrap();
+        let ct = encrypt(&[1u8; KEY_LEN], b"secret", b"").unwrap();
         assert!(matches!(
-            decrypt(&[2u8; KEY_LEN], &ct),
+            decrypt(&[2u8; KEY_LEN], &ct, b""),
             Err(CryptoError::AuthenticationFailed)
         ));
     }
@@ -89,11 +106,25 @@ mod tests {
     #[test]
     fn tampered_ciphertext_fails_auth() {
         let key = [3u8; KEY_LEN];
-        let mut ct = encrypt(&key, b"secret").unwrap();
+        let mut ct = encrypt(&key, b"secret", b"").unwrap();
         let last = ct.len() - 1;
         ct[last] ^= 0x01;
         assert!(matches!(
-            decrypt(&key, &ct),
+            decrypt(&key, &ct, b""),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn wrong_aad_fails_auth() {
+        let key = [5u8; KEY_LEN];
+        let ct = encrypt(&key, b"secret", b"vault-A/file-1").unwrap();
+        assert!(matches!(
+            decrypt(&key, &ct, b"vault-A/file-2"),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+        assert!(matches!(
+            decrypt(&key, &ct, b""),
             Err(CryptoError::AuthenticationFailed)
         ));
     }
@@ -101,7 +132,7 @@ mod tests {
     #[test]
     fn short_blob_rejected() {
         assert!(matches!(
-            decrypt(&[0u8; KEY_LEN], &[1, 2, 3]),
+            decrypt(&[0u8; KEY_LEN], &[1, 2, 3], b""),
             Err(CryptoError::InvalidFormat(_))
         ));
     }
@@ -109,8 +140,8 @@ mod tests {
     #[test]
     fn empty_plaintext_round_trip() {
         let key = [4u8; KEY_LEN];
-        let ct = encrypt(&key, b"").unwrap();
+        let ct = encrypt(&key, b"", b"ctx").unwrap();
         assert_eq!(ct.len(), IV_LEN + TAG_LEN);
-        assert_eq!(decrypt(&key, &ct).unwrap(), b"");
+        assert_eq!(decrypt(&key, &ct, b"ctx").unwrap(), b"");
     }
 }

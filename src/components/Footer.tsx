@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 const LINKEDIN_URL = "https://www.linkedin.com/in/amitxbhatnagar/";
@@ -17,11 +19,19 @@ export function LinkedInIcon({ size = 16 }: { size?: number }) {
   );
 }
 
-/** Copyright + credit footer. */
+/** Copyright + credit + version footer. */
 export function Footer({ className = "" }: { className?: string }) {
+  const [version, setVersion] = useState("");
+
+  useEffect(() => {
+    getVersion()
+      .then(setVersion)
+      .catch(() => setVersion(""));
+  }, []);
+
   return (
     <footer
-      className={`flex items-center justify-center gap-3 py-5 text-xs text-ink-faint ${className}`}
+      className={`flex flex-wrap items-center justify-center gap-3 py-5 text-xs text-ink-faint ${className}`}
     >
       <span>© 2026 Amit Bhatnagar</span>
       <span className="text-line-strong">·</span>
@@ -37,6 +47,14 @@ export function Footer({ className = "" }: { className?: string }) {
         <LinkedInIcon size={15} />
         LinkedIn
       </a>
+      {version && (
+        <>
+          <span className="text-line-strong">·</span>
+          <span className="mono-value text-[11px]" title="Application version">
+            v{version}
+          </span>
+        </>
+      )}
     </footer>
   );
 }

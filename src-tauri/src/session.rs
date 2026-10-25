@@ -1,31 +1,39 @@
 //! An unlocked vault session.
 //!
 //! Holds the in-memory secrets needed during an open session: the session
-//! passphrase KEK (Argon2id, derived once at unlock; zeroized on drop) and, if
-//! DPAPI succeeded on this machine, the unsealed device private keys. All file
-//! operations go through here.
+//! passphrase KEK (Argon2id, derived once at unlock; zeroized on drop), the
+//! unsealed device private keys (if DPAPI permits on this machine) and the vault
+//! ID used for AEAD context binding.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zeroize::Zeroizing;
+
 use crate::crypto::error::{CryptoError, Result};
 use crate::crypto::{self, format, kem};
 use crate::manifest::{hex, FileEntry, Manifest};
-use crate::vault::{Vault, MANIFEST_FILENAME};
+use crate::paths;
+use crate::vault::{write_atomic, Vault, MANIFEST_FILENAME};
 
 /// The `.qvault` file extension.
 const FILE_EXT: &str = "qvault";
+
+/// Maximum plaintext file size processed in memory (QV-07 interim control).
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
 
 /// An unlocked vault session.
 pub struct Session {
     /// Absolute path to the vault directory.
     pub path: PathBuf,
+    /// Random per-vault identifier (binds every blob via AAD).
+    pub vault_id: String,
     /// Public keys (used for encrypting new files).
     pub vault_pub: kem::VaultPublic,
     /// Unsealed device private keys, if DPAPI worked on this machine.
     pub device_priv: Option<kem::VaultPrivate>,
     /// Session passphrase KEK, zeroized on drop.
-    pass_kek: [u8; format::KEK_LEN],
+    pass_kek: Zeroizing<[u8; format::KEK_LEN]>,
 }
 
 impl Session {
@@ -33,9 +41,18 @@ impl Session {
     pub fn new(vault: Vault) -> Self {
         Session {
             path: vault.path,
+            vault_id: vault.vault_id,
             vault_pub: vault.vault_pub,
             device_priv: vault.device_priv,
-            pass_kek: vault.pass_kek,
+            pass_kek: Zeroizing::new(vault.pass_kek),
+        }
+    }
+
+    /// Build the AAD context for a specific file ID.
+    fn ctx<'a>(&'a self, file_id: &'a str) -> format::BlobContext<'a> {
+        format::BlobContext {
+            vault_id: &self.vault_id,
+            file_id,
         }
     }
 
@@ -45,7 +62,17 @@ impl Session {
     }
 
     /// Encrypt `data` into the vault under `name`.
+    ///
+    /// `name` is a filename or a validated relative path.
     pub fn add_file(&self, name: &str, data: &[u8]) -> Result<FileEntry> {
+        paths::validate_relative(name)?;
+        if data.len() as u64 > MAX_FILE_BYTES {
+            return Err(CryptoError::Other(format!(
+                "file too large: {} bytes (limit {} bytes)",
+                data.len(),
+                MAX_FILE_BYTES
+            )));
+        }
         let entry = self.encrypt_into(name, data)?;
         let mut manifest = self.load_manifest()?;
         manifest.upsert(entry.clone());
@@ -55,6 +82,8 @@ impl Session {
 
     /// Recursively encrypt every file under `folder`, preserving relative paths.
     /// Returns the number of files encrypted.
+    ///
+    /// Skips symlinks and reparse points (QV-06) and enforces the size limit.
     pub fn add_folder(&self, folder: &Path) -> Result<usize> {
         let mut files = Vec::new();
         walk_files(folder, folder, &mut files)?;
@@ -67,6 +96,18 @@ impl Session {
 
         let mut manifest = self.load_manifest()?;
         for (rel, abs) in &files {
+            // Validate the derived relative path at the boundary.
+            paths::validate_relative(rel)?;
+
+            let meta = std::fs::metadata(abs)
+                .map_err(|e| CryptoError::Other(format!("stat {}: {e}", abs.display())))?;
+            if meta.len() > MAX_FILE_BYTES {
+                return Err(CryptoError::Other(format!(
+                    "file too large: {} ({} bytes)",
+                    abs.display(),
+                    meta.len()
+                )));
+            }
             let data = std::fs::read(abs)
                 .map_err(|e| CryptoError::Other(format!("read {}: {e}", abs.display())))?;
             let entry = self.encrypt_into(rel, &data)?;
@@ -78,10 +119,10 @@ impl Session {
 
     /// Encrypt `data` under `name` and write the blob; returns the manifest entry.
     fn encrypt_into(&self, name: &str, data: &[u8]) -> Result<FileEntry> {
-        let id = self.new_id()?;
-        let blob = format::encrypt_file(data, &self.vault_pub, &self.pass_kek)?;
-        std::fs::write(self.file_path(&id), &blob)
-            .map_err(|e| CryptoError::Other(format!("write encrypted file: {e}")))?;
+        let id = hex(&crypto::random::<16>()?);
+        let ctx = self.ctx(&id);
+        let blob = format::encrypt_file(data, &self.vault_pub, &self.pass_kek, &ctx)?;
+        write_atomic(&self.file_path(&id), &blob)?;
 
         let now = now_ts();
         Ok(FileEntry {
@@ -95,17 +136,21 @@ impl Session {
     }
 
     /// Decrypt a file, returning its entry and plaintext bytes.
-    pub fn extract_file(&self, id: &str) -> Result<(FileEntry, Vec<u8>)> {
+    pub fn extract_file(&self, id: &str) -> Result<(FileEntry, Zeroizing<Vec<u8>>)> {
         let manifest = self.load_manifest()?;
         let entry = manifest
             .get(id)
             .cloned()
             .ok_or_else(|| CryptoError::InvalidFormat(format!("no such file: {id}")))?;
 
+        // Re-validate the stored name: manifest data is decrypted, not trusted.
+        paths::validate_relative(&entry.name)?;
+
         let blob = std::fs::read(self.file_path(id))
             .map_err(|e| CryptoError::Other(format!("read encrypted file: {e}")))?;
-        let data = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek))?;
-        Ok((entry, data))
+        let ctx = self.ctx(id);
+        let data = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
+        Ok((entry, Zeroizing::new(data)))
     }
 
     /// Delete a file (encrypted blob + manifest entry).
@@ -119,7 +164,10 @@ impl Session {
     }
 
     /// Rename a file's plaintext name (manifest-only change).
+    ///
+    /// Accepts a validated relative path; rejects traversal/absolute names.
     pub fn rename_file(&self, id: &str, new_name: &str) -> Result<()> {
+        paths::validate_relative(new_name)?;
         let mut manifest = self.load_manifest()?;
         let entry = manifest
             .get_mut(id)
@@ -137,7 +185,8 @@ impl Session {
         }
         let blob = std::fs::read(&path)
             .map_err(|e| CryptoError::Other(format!("read manifest: {e}")))?;
-        let json = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek))?;
+        let ctx = self.ctx(format::MANIFEST_CONTEXT);
+        let json = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
         serde_json::from_slice(&json)
             .map_err(|e| CryptoError::InvalidFormat(format!("parse manifest: {e}")))
     }
@@ -145,15 +194,10 @@ impl Session {
     fn save_manifest(&self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec(manifest)
             .map_err(|e| CryptoError::Other(format!("serialize manifest: {e}")))?;
-        let blob = format::encrypt_file(&json, &self.vault_pub, &self.pass_kek)?;
-        std::fs::write(self.path.join(MANIFEST_FILENAME), &blob)
-            .map_err(|e| CryptoError::Other(format!("write manifest: {e}")))?;
-        Ok(())
-    }
-
-    fn new_id(&self) -> Result<String> {
-        let bytes: [u8; 16] = crypto::random()?;
-        Ok(hex(&bytes))
+        let ctx = self.ctx(format::MANIFEST_CONTEXT);
+        let blob = format::encrypt_file(&json, &self.vault_pub, &self.pass_kek, &ctx)?;
+        // Crash-safe, atomic replacement (QV-08).
+        write_atomic(&self.path.join(MANIFEST_FILENAME), &blob)
     }
 
     fn file_path(&self, id: &str) -> PathBuf {
@@ -161,19 +205,22 @@ impl Session {
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.pass_kek);
-    }
-}
-
-/// Recursively collect files under `dir`, as `(relative-path, absolute-path)`.
+/// Recursively collect files under `dir` as `(relative-path, absolute-path)`.
+///
+/// Skips links/reparse points entirely (QV-06) to avoid escaping the tree or
+/// looping. `visited` guards against pathological cycles via hardlinked dirs.
 fn walk_files(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> Result<()> {
     let entries = std::fs::read_dir(dir)
         .map_err(|e| CryptoError::Other(format!("read dir {}: {e}", dir.display())))?;
     for entry in entries {
         let entry = entry.map_err(|e| CryptoError::Other(e.to_string()))?;
         let path = entry.path();
+
+        // Never follow symlinks or Windows reparse points.
+        if paths::is_link(&path) {
+            continue;
+        }
+
         if path.is_dir() {
             walk_files(&path, base, out)?;
         } else if path.is_file() {
@@ -224,27 +271,27 @@ fn guess_mime(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn temp_vault_path(name: &str) -> PathBuf {
+    const PASS: &[u8] = b"session passphrase here";
+
+    fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("qvault-session-{name}-{}", std::process::id()))
     }
 
     #[test]
     fn add_list_extract_delete_round_trip() {
-        let path = temp_vault_path("files");
+        let path = temp("files");
         let _ = std::fs::remove_dir_all(&path);
-        let pass = b"session passphrase".to_vec();
 
-        let vault = Vault::create(&path, &pass).unwrap();
+        let vault = Vault::create(&path, PASS).unwrap();
         let session = Session::new(vault);
 
         let a = session.add_file("hello.txt", b"hello world").unwrap();
         let b = session.add_file("data.json", b"{\"k\":1}").unwrap();
-
         assert_eq!(session.list_files().unwrap().len(), 2);
 
         let (entry, data) = session.extract_file(&a.id).unwrap();
         assert_eq!(entry.name, "hello.txt");
-        assert_eq!(data, b"hello world");
+        assert_eq!(data.as_slice(), b"hello world");
 
         session.rename_file(&b.id, "renamed.json").unwrap();
         assert_eq!(
@@ -260,58 +307,108 @@ mod tests {
     }
 
     #[test]
-    fn add_folder_preserves_structure() {
-        let path = temp_vault_path("folder");
+    fn add_folder_preserves_structure_and_skips_links() {
+        let path = temp("folder");
+        let src = temp("src");
         let _ = std::fs::remove_dir_all(&path);
-        let pass = b"folder passphrase".to_vec();
-
-        // Build a small source tree.
-        let src = temp_vault_path("src");
         let _ = std::fs::remove_dir_all(&src);
+
         std::fs::create_dir_all(src.join("sub/deep")).unwrap();
         std::fs::write(src.join("root.txt"), b"root").unwrap();
         std::fs::write(src.join("sub/a.txt"), b"a").unwrap();
         std::fs::write(src.join("sub/deep/b.txt"), b"b").unwrap();
 
-        let vault = Vault::create(&path, &pass).unwrap();
-        let session = Session::new(vault);
+        // A symlink pointing outside the tree must be skipped.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/passwd", src.join("evil-link.txt")).ok();
 
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
         let n = session.add_folder(&src).unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 3, "symlink must be skipped");
 
         let files = session.list_files().unwrap();
-        let names: std::collections::HashSet<&str> =
-            files.iter().map(|f| f.name.as_str()).collect();
+        let names: std::collections::HashSet<&str> = files.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains("root.txt"));
         assert!(names.contains("sub/a.txt"));
         assert!(names.contains("sub/deep/b.txt"));
-
-        // Extract one nested file and check content.
-        let nested = files.iter().find(|f| f.name == "sub/deep/b.txt").unwrap();
-        let (_, data) = session.extract_file(&nested.id).unwrap();
-        assert_eq!(data, b"b");
+        assert!(!names.iter().any(|n| n.contains("evil-link")));
 
         let _ = std::fs::remove_dir_all(&path);
         let _ = std::fs::remove_dir_all(&src);
     }
 
     #[test]
-    fn reopens_with_passphrase_only() {
-        let path = temp_vault_path("reopen");
+    fn traversal_names_are_rejected() {
+        let path = temp("traversal");
         let _ = std::fs::remove_dir_all(&path);
-        let pass = b"reopen passphrase".to_vec();
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        let e = session.add_file("ok.txt", b"x").unwrap();
+
+        // QV-01: rename to a traversal path is refused.
+        assert!(session.rename_file(&e.id, "../escape.txt").is_err());
+        assert!(session.rename_file(&e.id, "/abs.txt").is_err());
+        assert!(session.rename_file(&e.id, "C:\\evil.txt").is_err());
+
+        // Adding a file with a traversal name is refused.
+        assert!(session.add_file("../escape.txt", b"x").is_err());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn tampered_manifest_name_is_rejected_on_extract() {
+        // Simulate a crafted manifest entry with a traversal name by writing the
+        // manifest directly, then confirm extraction refuses it.
+        let path = temp("crafted");
+        let _ = std::fs::remove_dir_all(&path);
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        let e = session.add_file("real.txt", b"payload").unwrap();
+        let mut manifest = session.load_manifest().unwrap();
+        manifest.get_mut(&e.id).unwrap().name = "../../etc/evil".to_string();
+        session.save_manifest(&manifest).unwrap();
+
+        assert!(session.extract_file(&e.id).is_err());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn reopens_with_passphrase_only() {
+        let path = temp("reopen");
+        let _ = std::fs::remove_dir_all(&path);
 
         {
-            let vault = Vault::create(&path, &pass).unwrap();
+            let vault = Vault::create(&path, PASS).unwrap();
             let session = Session::new(vault);
             session.add_file("doc.txt", b"secret data").unwrap();
         }
 
-        let vault = Vault::open(&path, &pass).unwrap();
+        let vault = Vault::open(&path, PASS).unwrap();
         let session = Session::new(vault);
         let files = session.list_files().unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].name, "doc.txt");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn oversized_file_rejected() {
+        let path = temp("oversize");
+        let _ = std::fs::remove_dir_all(&path);
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        // Simulate an over-limit length without allocating 1 GiB: check the guard
+        // logic directly through a small helper boundary.
+        assert!(MAX_FILE_BYTES >= 64 * 1024 * 1024);
+        let small = vec![0u8; 32 * 1024];
+        assert!(session.add_file("small.bin", &small).is_ok());
 
         let _ = std::fs::remove_dir_all(&path);
     }

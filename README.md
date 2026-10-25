@@ -29,8 +29,12 @@ computer cannot recover your files:
 | Key derivation | **Argon2id** (256 MiB) | Memory-hard passphrase hashing |
 | File encryption | **AES-256-GCM** | Authenticated confidentiality |
 
-The file key is wrapped by **both** legs — an attacker must break *both* the
-lattice problem *and* the elliptic-curve problem to recover anything.
+The file key is wrapped by both a **device leg** (hybrid X25519 + ML-KEM) and a
+**passphrase leg** (Argon2id). These are two *alternative* unlock paths: the
+hybrid KEM protects the device-bound leg, while recovery on another machine uses
+the passphrase leg. **Practical security of a stolen vault therefore rests on
+your passphrase strength, hardened by Argon2id** — see [SECURITY.md](SECURITY.md)
+for the exact threat model.
 
 ## How it works
 
@@ -48,7 +52,9 @@ lattice problem *and* the elliptic-curve problem to recover anything.
 ## Features
 
 - 🔐 **ML-KEM-768 + X25519 hybrid** key encapsulation
-- 📁 Encrypt **entire folders** recursively (structure preserved)
+- 🧩 **AEAD context binding** — blobs are bound to their vault and file ID
+- 🛡️ **Path-traversal safe** — filenames validated in the Rust backend
+- 📁 Encrypt **entire folders** recursively (structure preserved, links skipped)
 - 👁️ **In-app preview** of images and text without extracting
 - 🧠 **Multiple vaults** — each with its own passphrase and lock state
 - 🟢 **Availability check** — shows whether a vault's folder is still present
@@ -93,6 +99,11 @@ src-tauri/src/
 > ⚠️ **No recovery.** Your passphrase is never stored or recoverable. If you lose
 > it, your files are gone. The `vault.meta` file is essential — deleting it makes
 > the vault permanently unreadable.
+
+## Security
+
+Please read [SECURITY.md](SECURITY.md) before storing sensitive data. It documents
+the threat model, the key-wrapping trade-offs, and current limits.
 
 ## Author
 
