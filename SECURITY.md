@@ -76,25 +76,54 @@ detectable.
 
 ## Path safety
 
-Filenames are validated in the **Rust backend**, never trusting the manifest:
+Filenames and identifiers are validated in the **Rust backend**, never trusting
+the manifest (decrypted data is not trusted input):
 
-- Single-file names must be a plain basename (no separators, no drive/UNC
+- **File IDs** must be exactly 32 lowercase hex characters. The grammar is
+  enforced in the path helper itself, when parsing the manifest, and at every
+  IPC command — so a crafted ID cannot escape the vault directory.
+- **Single-file names** must be a plain basename (no separators, no drive/UNC
   prefixes, no `.`/`..`, no control characters, no trailing dot/space, no
   reserved device names).
-- Relative paths only accept ordinary components.
-- Extraction re-validates the decrypted name and asserts the destination stays
-  inside the chosen directory.
-- Symlinks and Windows reparse points (junctions) are **never followed** during
-  folder encryption or vault discovery.
+- **Relative paths** only accept ordinary components.
+- **Extraction** re-validates the decrypted name, then walks the destination one
+  component at a time, refusing any existing symlink or reparse point in the
+  chain, and creates the file with `create_new` (no overwrite, no redirection).
+- **Deletion** requires the ID to exist in the manifest before either the
+  manifest or the disk is touched, and removes the blob before the manifest entry
+  so a failure leaves a recoverable reference rather than an orphan.
+- Symlinks and junctions are **never followed** during folder encryption or
+  vault discovery.
+
+Residual limitation: a filesystem race (a path component swapped between the
+check and the write) cannot be fully eliminated without directory-handle-relative
+operations; the window is reduced to a single component check per operation.
+
+## Metadata integrity
+
+`vault.meta` is security-critical: it holds the public keys that future files are
+wrapped to. It is authenticated by the passphrase verifier, which carries a
+SHA-256 digest over the format, version, vault ID, both public keys, the sealed
+device key and the verifier salt.
+
+- Substituting public keys (or any of those fields) makes the vault **fail
+  closed** on unlock, rather than silently encrypting new files to an attacker's
+  keys.
+- On the machine where DPAPI unsealing succeeds, the public keys in the metadata
+  are additionally checked against the keys derived from the unsealed private
+  keys.
+- This check works on a fresh machine too: it relies on the passphrase, not on
+  the device key.
 
 ## Limits & known constraints
 
 | Area | Current behaviour |
 |---|---|
-| File size | Files above **1 GiB** are rejected (in-memory processing, interim control) |
+| File size | Files above **1 GiB** are rejected. Files are still processed whole in memory, so peak RSS can be several times the file size; the cap is an interim control until a chunked format exists |
 | Concurrency | Single-process; cloud-sync conflict resolution is not implemented |
-| Manifest | Written atomically (temp file → rename) but not versioned/rollback-proof |
-| Zeroization | Secrets held in `Zeroizing` buffers; compiler/allocator copies cannot be fully erased |
+| Manifest | Written atomically (temp file → fsync → rename); blob+manifest updates are not one transaction, so a crash can leave orphaned blobs |
+| Extraction | Refuses to overwrite an existing file; renames/creates are not transactional |
+| Zeroization | Private keys, file keys, KEKs, KEM IKM and plaintext are held in `Zeroizing` containers; compiler/allocator copies and crash dumps cannot be fully erased |
 | Rollback | A full-directory rollback by an attacker is not detectable without external trusted state |
 
 ## Non-goals
@@ -104,6 +133,16 @@ Filenames are validated in the **Rust backend**, never trusting the manifest:
 - Defending against an attacker who has your unlocked machine.
 - Hiding the fact that encrypted data exists (file sizes and count are visible).
 - Protecting metadata from a local attacker while the vault is unlocked.
+
+## Passphrase policy
+
+Enforced in the backend (not only the UI): minimum 12 characters or 4 words,
+minimum character variety, and rejection of common words/sequences
+(`password`, `qwerty`, `1234`, …).
+
+This is a **heuristic, not an entropy estimator**. A passphrase of common words
+chosen by a person can still be weak. Prefer a randomly generated multi-word
+passphrase.
 
 ## Reporting
 

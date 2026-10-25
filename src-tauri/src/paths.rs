@@ -95,6 +95,32 @@ pub fn validate_relative(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Length of a file ID in hex characters (16 random bytes → 32 hex chars).
+pub const FILE_ID_HEX_LEN: usize = 32;
+
+/// Validate a **file ID** (QV2-01).
+///
+/// IDs are generated internally as 16 random bytes hex-encoded, so the grammar
+/// is exact: 32 lowercase hex characters. Anything else — traversal, absolute
+/// paths, drive/UNC prefixes, mixed case, empty — is rejected. This must be
+/// enforced at *every* entry point that turns an ID into a path, including the
+/// manifest parser and IPC commands, because an encrypted manifest can carry
+/// attacker-chosen IDs.
+pub fn validate_file_id(id: &str) -> Result<()> {
+    if id.len() != FILE_ID_HEX_LEN {
+        return Err(CryptoError::InvalidFormat(format!(
+            "invalid file id: expected {FILE_ID_HEX_LEN} hex characters, got {}",
+            id.len()
+        )));
+    }
+    if !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(CryptoError::InvalidFormat(
+            "invalid file id: must be lowercase hexadecimal".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// True if `path` is a symlink or a Windows reparse point (junction).
 ///
 /// Used to refuse traversing out of the selected tree (QV-06).
@@ -126,6 +152,89 @@ pub fn safe_join(base: &Path, name: &str) -> Result<PathBuf> {
         return Err(bad("path escapes the destination directory"));
     }
     Ok(joined)
+}
+
+/// Resolve `rel` under `base`, creating directories as needed, refusing to
+/// traverse any existing symlink or reparse point (QV2-03).
+///
+/// Returns the full path to the (not yet created) leaf file.
+pub fn prepare_destination(base: &Path, rel: &str) -> Result<PathBuf> {
+    // Layer 1: grammar + lexical containment.
+    let _ = safe_join(base, rel)?;
+
+    // Base must exist and must not itself be a link.
+    if is_link(base) {
+        return Err(bad("destination directory is a link"));
+    }
+
+    let mut cur = base.to_path_buf();
+    let components: Vec<_> = Path::new(rel)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            _ => None,
+        })
+        .collect();
+
+    if components.is_empty() {
+        return Err(bad("path has no name components"));
+    }
+
+    // Walk every directory component, refusing links in the existing chain.
+    for dir in &components[..components.len() - 1] {
+        cur.push(dir);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if is_link(&cur) {
+                    return Err(bad(format!(
+                        "'{}' is a symlink or junction; refusing to follow it",
+                        cur.display()
+                    )));
+                }
+                if !meta.is_dir() {
+                    return Err(bad(format!(
+                        "'{}' exists and is not a directory",
+                        cur.display()
+                    )));
+                }
+            }
+            Err(_) => {
+                std::fs::create_dir(&cur).map_err(|e| {
+                    CryptoError::Other(format!("create dir {}: {e}", cur.display()))
+                })?;
+            }
+        }
+    }
+
+    cur.push(components.last().unwrap());
+    Ok(cur)
+}
+
+/// Create a new file at `base/rel` without following links and without
+/// overwriting an existing file.
+///
+/// `create_new` maps to `O_CREAT|O_EXCL` / `CREATE_NEW`, which fails if the
+/// path already exists — including when it is a link to an existing file. That
+/// makes the write fail closed rather than clobbering or redirecting.
+pub fn create_file_nofollow(base: &Path, rel: &str) -> Result<(PathBuf, std::fs::File)> {
+    let dest = prepare_destination(base, rel)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)
+    {
+        Ok(f) => Ok((dest, f)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(CryptoError::Other(
+            format!(
+                "a file already exists at '{}' — refusing to overwrite",
+                dest.display()
+            ),
+        )),
+        Err(e) => Err(CryptoError::Other(format!(
+            "create {}: {e}",
+            dest.display()
+        ))),
+    }
 }
 
 /// Lexical containment: `child` must not resolve above `base`.
@@ -239,6 +348,84 @@ mod tests {
         assert!(safe_join(base, "sub/ok.txt").is_ok());
         assert!(safe_join(base, "../escape.txt").is_err());
         assert!(safe_join(base, "sub/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn file_id_accepts_generated_form() {
+        assert!(validate_file_id("0123456789abcdef0123456789abcdef").is_ok());
+        assert!(validate_file_id(&"a".repeat(32)).is_ok());
+    }
+
+    #[test]
+    fn file_id_rejects_traversal_and_malformed() {
+        // QV2-01 regression.
+        for bad_id in [
+            "../0123456789abcdef0123456789abcd",
+            "..\\0123456789abcdef0123456789abc",
+            "/etc/passwd",
+            "C:\\evil",
+            "",
+            "abc",
+            "0123456789abcdef0123456789ABCDEF", // uppercase
+            "0123456789abcdef0123456789abcdeg", // non-hex
+            "0123456789abcdef0123456789abcdef0", // too long
+        ] {
+            assert!(validate_file_id(bad_id).is_err(), "id '{bad_id}' must be rejected");
+        }
+    }
+
+    #[test]
+    fn create_file_nofollow_writes_nested() {
+        let base = std::env::temp_dir().join(format!("qvault-nf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let (dest, mut f) = create_file_nofollow(&base, "sub/dir/file.txt").unwrap();
+        std::io::Write::write_all(&mut f, b"hi").unwrap();
+        drop(f);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hi");
+        assert!(dest.starts_with(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn create_file_nofollow_refuses_overwrite() {
+        let base = std::env::temp_dir().join(format!("qvault-nf2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("exists.txt"), b"original").unwrap();
+
+        assert!(create_file_nofollow(&base, "exists.txt").is_err());
+        // Original untouched.
+        assert_eq!(std::fs::read(base.join("exists.txt")).unwrap(), b"original");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn create_file_nofollow_rejects_symlinked_dir() {
+        // QV2-03 regression: a symlink inside the destination must not redirect.
+        let base = std::env::temp_dir().join(format!("qvault-nf3-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("qvault-nf3-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, base.join("sub")).unwrap();
+            let res = create_file_nofollow(&base, "sub/report.txt");
+            assert!(res.is_err(), "must refuse to write through a symlinked dir");
+            assert!(
+                !outside.join("report.txt").exists(),
+                "nothing may be written outside the destination"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

@@ -52,19 +52,44 @@ pub fn derive(passphrase: &[u8], salt: &[u8]) -> Result<[u8; KEY_LEN]> {
     Ok(out)
 }
 
-/// Basic UI-facing strength check. Returns a reason the passphrase is weak, or
-/// `None` if acceptable. Kept in sync with the Android app's guidance.
+/// Common/compromised substrings that make a passphrase guessable regardless
+/// of length (QV2-07). Checked case-insensitively.
+const WEAK_PATTERNS: &[&str] = &[
+    "password", "passphrase", "letmein", "welcome", "iloveyou", "admin",
+    "qwerty", "asdf", "zxcv", "1234", "abcd", "monkey", "dragon", "football",
+    "master", "login", "secret", "changeme", "trustno1", "sunshine",
+];
+
+/// Strength assessment shared by the UI and the backend policy.
+///
+/// Returns `None` when acceptable, or a human-readable reason.
+///
+/// This is deliberately conservative but *heuristic*: it favours length and
+/// randomness, and rejects obviously weak material. It is not an entropy
+/// estimator — a short passphrase built from common words can still be weak
+/// even if it passes. Users should prefer randomly generated multi-word
+/// passphrases.
 pub fn strength_problem(passphrase: &str) -> Option<&'static str> {
-    let word_count = passphrase.split(' ').filter(|w| !w.is_empty()).count();
-    if passphrase.len() < 12 && word_count < 4 {
+    let chars = passphrase.chars().count();
+    let words = passphrase.split(' ').filter(|w| !w.is_empty()).count();
+
+    if chars < 12 && words < 4 {
         return Some("Use at least 12 characters or a 4-word passphrase");
     }
-    if matches!(
-        passphrase.to_ascii_lowercase().as_str(),
-        "password" | "passphrase" | "123456789012" | "password1234"
-    ) {
-        return Some("That passphrase is a gift to attackers — pick something unique");
+
+    // Too little variety (e.g. "aaaaaaaaaaaa", "abababababab").
+    let mut unique = passphrase.chars().collect::<Vec<_>>();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() < 5 {
+        return Some("Too few distinct characters — use something less repetitive");
     }
+
+    let lower = passphrase.to_ascii_lowercase();
+    if WEAK_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return Some("Contains a very common word or sequence — pick something unique");
+    }
+
     None
 }
 
@@ -123,7 +148,21 @@ mod tests {
     }
 
     #[test]
+    fn strength_check_flags_common_and_repetitive() {
+        // QV2-07: common sequences and low-variety strings are rejected.
+        assert!(strength_problem("qwertyuiop12").is_some());
+        assert!(strength_problem("MyPassword2024").is_some());
+        assert!(strength_problem("aaaaaaaaaaaaaa").is_some());
+        assert!(strength_problem("ababababababab").is_some());
+    }
+
+    #[test]
+    fn strength_check_accepts_four_random_words() {
+        assert!(strength_problem("harbor static pebble wing").is_none());
+    }
+
+    #[test]
     fn strength_check_accepts_long() {
-        assert!(strength_problem("this is a fairly long passphrase").is_none());
+        assert!(strength_problem("tundra velvet orbit lamplight").is_none());
     }
 }

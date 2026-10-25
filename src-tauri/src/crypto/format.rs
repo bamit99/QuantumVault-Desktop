@@ -126,8 +126,8 @@ pub fn encrypt_file(
 
     // 3. Device leg: hybrid KEM → KEK → wrap FileKey.
     let encap = kem::encapsulate(vault_pub)?;
-    let device_kek = zeroize::Zeroizing::new(encap.kek);
-    let wrapped_device = aead::encrypt(&device_kek, &*file_key, &keywrap_aad)?;
+    let device_kek = &encap.kek;
+    let wrapped_device = aead::encrypt(device_kek, &*file_key, &keywrap_aad)?;
 
     // 4. Passphrase leg: wrap FileKey with the session passphrase KEK.
     let wrapped_pass = aead::encrypt(pass_kek, &*file_key, &keywrap_aad)?;

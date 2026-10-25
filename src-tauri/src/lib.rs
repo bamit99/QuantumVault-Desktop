@@ -277,13 +277,15 @@ fn extract_file_to(
 ) -> Result<String, String> {
     with_session(&state, &vault, |s| {
         let (entry, data) = s.extract_file(&id).map_err(|e| e.to_string())?;
-        // QV-01: validate the name and assert containment before writing.
-        let dest = crate::paths::safe_join(Path::new(&dest_dir), &entry.name)
+        // QV2-03: create the destination without following links or junctions,
+        // and refuse to overwrite an existing file. Path checks alone are not
+        // enough: a pre-existing symlink under the destination could redirect a
+        // lexically-valid relative path outside the chosen directory.
+        let (dest, mut file) = crate::paths::create_file_nofollow(Path::new(&dest_dir), &entry.name)
             .map_err(|e| e.to_string())?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("create dirs: {e}"))?;
-        }
-        std::fs::write(&dest, &*data).map_err(|e| format!("write file: {e}"))?;
+        std::io::Write::write_all(&mut file, &data).map_err(|e| format!("write file: {e}"))?;
+        file.sync_all()
+            .map_err(|e| format!("sync file: {e}"))?;
         Ok(dest.to_string_lossy().to_string())
     })
 }

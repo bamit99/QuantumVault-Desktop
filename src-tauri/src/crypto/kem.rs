@@ -18,6 +18,7 @@ use ml_kem::{
 };
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+use zeroize::Zeroizing;
 
 use super::error::{CryptoError, Result};
 
@@ -52,17 +53,21 @@ pub struct VaultPublic {
 }
 
 /// The private half of a vault's keypair (what the decryptor needs).
+///
+/// Secret bytes are held in `Zeroizing` containers and wiped on drop (QV2-05).
+/// Note the usual caveat: allocator copies, crash dumps and compiler behaviour
+/// mean this reduces exposure lifetime; it is not a guarantee of erasure.
 pub struct VaultPrivate {
     /// ML-KEM-768 decapsulation (private) key, encoded.
-    pub mlkem: Vec<u8>,
+    pub mlkem: Zeroizing<Vec<u8>>,
     /// X25519 static secret scalar.
-    pub x25519: [u8; X25519_PUB_LEN],
+    pub x25519: Zeroizing<[u8; X25519_PUB_LEN]>,
 }
 
 impl VaultPrivate {
     /// Derive the corresponding public half.
     pub fn public(&self) -> VaultPublic {
-        let sk = StaticSecret::from(self.x25519);
+        let sk = StaticSecret::from(*self.x25519);
         let x_pub = PublicKey::from(&sk).to_bytes();
         // ML-KEM public key is derivable from the private key via the KEM trait.
         let dk = mlkem_dk_from_bytes(&self.mlkem)
@@ -79,8 +84,8 @@ pub fn generate_keypair() -> VaultPrivate {
     let (dk, _ek) = MlKem768::generate_keypair();
     let sk = StaticSecret::random();
     VaultPrivate {
-        mlkem: dk.to_bytes().to_vec(),
-        x25519: sk.to_bytes(),
+        mlkem: Zeroizing::new(dk.to_bytes().to_vec()),
+        x25519: Zeroizing::new(sk.to_bytes()),
     }
 }
 
@@ -92,8 +97,8 @@ pub struct Encapsulation {
     pub ct: Vec<u8>,
     /// HKDF salt.
     pub salt: [u8; SALT_LEN],
-    /// The derived key-encryption key (32 B).
-    pub kek: [u8; KEK_LEN],
+    /// The derived key-encryption key (32 B), zeroized on drop.
+    pub kek: Zeroizing<[u8; KEK_LEN]>,
 }
 
 /// Encapsulate a fresh key-encryption key to the vault's public keys.
@@ -113,19 +118,19 @@ pub fn encapsulate(vault_pub: &VaultPublic) -> Result<Encapsulation> {
     let ek = mlkem_ek_from_bytes(&vault_pub.mlkem)?;
     let (ct, shared_pq) = ek.encapsulate();
 
-    // Combine both shared secrets.
-    let mut ikm = [0u8; 2 * X25519_PUB_LEN];
+    // Combine both shared secrets (IKM is secret, so zeroize it).
+    let mut ikm = Zeroizing::new([0u8; 2 * X25519_PUB_LEN]);
     ikm[..X25519_PUB_LEN].copy_from_slice(shared_x.as_bytes());
     ikm[X25519_PUB_LEN..].copy_from_slice(shared_pq.as_slice());
 
     let salt: [u8; SALT_LEN] = super::random()?;
-    let kek = hkdf_sha256(&ikm, &salt)?;
+    let kek = hkdf_sha256(&ikm[..], &salt)?;
 
     Ok(Encapsulation {
         eph_pub,
         ct: ct.as_slice().to_vec(),
         salt,
-        kek,
+        kek: Zeroizing::new(kek),
     })
 }
 
@@ -137,7 +142,7 @@ pub fn decapsulate(
     salt: &[u8; SALT_LEN],
 ) -> Result<[u8; KEK_LEN]> {
     // Classical leg.
-    let sk = StaticSecret::from(vault_priv.x25519);
+    let sk = StaticSecret::from(*vault_priv.x25519);
     let eph_pub = PublicKey::from(*eph_pub);
     let shared_x = sk.diffie_hellman(&eph_pub);
     require_contributory(&shared_x)?;
@@ -148,11 +153,11 @@ pub fn decapsulate(
         .map_err(|e| CryptoError::InvalidFormat(format!("ML-KEM ciphertext: {e}")))?;
     let shared_pq = dk.decapsulate(&ct);
 
-    let mut ikm = [0u8; 2 * X25519_PUB_LEN];
+    let mut ikm = Zeroizing::new([0u8; 2 * X25519_PUB_LEN]);
     ikm[..X25519_PUB_LEN].copy_from_slice(shared_x.as_bytes());
     ikm[X25519_PUB_LEN..].copy_from_slice(shared_pq.as_slice());
 
-    hkdf_sha256(&ikm, salt)
+    hkdf_sha256(&ikm[..], salt)
 }
 
 /// HKDF-SHA256 key-derivation (extract + expand to 32 bytes).
@@ -195,7 +200,7 @@ mod tests {
 
         let encap = encapsulate(&pubk).unwrap();
         let recovered = decapsulate(&privk, &encap.eph_pub, &encap.ct, &encap.salt).unwrap();
-        assert_eq!(encap.kek, recovered);
+        assert_eq!(&encap.kek[..], &recovered[..]);
     }
 
     #[test]
@@ -215,7 +220,7 @@ mod tests {
         let b = encapsulate(&pubk).unwrap();
         assert_ne!(a.ct, b.ct);
         assert_ne!(a.eph_pub, b.eph_pub);
-        assert_ne!(a.kek, b.kek);
+        assert_ne!(&a.kek[..], &b.kek[..]);
     }
 
     #[test]
@@ -226,7 +231,7 @@ mod tests {
         // Decapsulation with the wrong key yields a different KEK (KEM implicit
         // rejection), not the same one.
         let wrong = decapsulate(&other, &encap.eph_pub, &encap.ct, &encap.salt).unwrap();
-        assert_ne!(encap.kek, wrong);
+        assert_ne!(&encap.kek[..], &wrong[..]);
     }
 
     #[test]
@@ -236,7 +241,7 @@ mod tests {
         let mut encap = encapsulate(&pubk).unwrap();
         encap.ct[0] ^= 0x01;
         let kek = decapsulate(&privk, &encap.eph_pub, &encap.ct, &encap.salt).unwrap();
-        assert_ne!(encap.kek, kek);
+        assert_ne!(&encap.kek[..], &kek[..]);
     }
 
     #[test]

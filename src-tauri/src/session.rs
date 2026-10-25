@@ -122,7 +122,7 @@ impl Session {
         let id = hex(&crypto::random::<16>()?);
         let ctx = self.ctx(&id);
         let blob = format::encrypt_file(data, &self.vault_pub, &self.pass_kek, &ctx)?;
-        write_atomic(&self.file_path(&id), &blob)?;
+        write_atomic(&self.file_path(&id)?, &blob)?;
 
         let now = now_ts();
         Ok(FileEntry {
@@ -137,6 +137,7 @@ impl Session {
 
     /// Decrypt a file, returning its entry and plaintext bytes.
     pub fn extract_file(&self, id: &str) -> Result<(FileEntry, Zeroizing<Vec<u8>>)> {
+        paths::validate_file_id(id)?;
         let manifest = self.load_manifest()?;
         let entry = manifest
             .get(id)
@@ -146,7 +147,7 @@ impl Session {
         // Re-validate the stored name: manifest data is decrypted, not trusted.
         paths::validate_relative(&entry.name)?;
 
-        let blob = std::fs::read(self.file_path(id))
+        let blob = std::fs::read(self.file_path(id)?)
             .map_err(|e| CryptoError::Other(format!("read encrypted file: {e}")))?;
         let ctx = self.ctx(id);
         let data = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
@@ -155,18 +156,31 @@ impl Session {
 
     /// Delete a file (encrypted blob + manifest entry).
     pub fn delete_file(&self, id: &str) -> Result<()> {
+        paths::validate_file_id(id)?;
         let mut manifest = self.load_manifest()?;
-        manifest.remove(id);
-        self.save_manifest(&manifest)?;
-        std::fs::remove_file(self.file_path(id))
+
+        // Refuse unknown IDs before touching either the manifest or the disk.
+        if manifest.get(id).is_none() {
+            return Err(CryptoError::InvalidFormat(format!(
+                "no such file: {id}"
+            )));
+        }
+        let blob_path = self.file_path(id)?;
+
+        // Remove the blob first: if this fails, the manifest still references it
+        // (recoverable) rather than leaving an unreferenced orphan.
+        std::fs::remove_file(&blob_path)
             .map_err(|e| CryptoError::Other(format!("delete encrypted file: {e}")))?;
-        Ok(())
+
+        manifest.remove(id);
+        self.save_manifest(&manifest)
     }
 
     /// Rename a file's plaintext name (manifest-only change).
     ///
     /// Accepts a validated relative path; rejects traversal/absolute names.
     pub fn rename_file(&self, id: &str, new_name: &str) -> Result<()> {
+        paths::validate_file_id(id)?;
         paths::validate_relative(new_name)?;
         let mut manifest = self.load_manifest()?;
         let entry = manifest
@@ -187,8 +201,18 @@ impl Session {
             .map_err(|e| CryptoError::Other(format!("read manifest: {e}")))?;
         let ctx = self.ctx(format::MANIFEST_CONTEXT);
         let json = format::decrypt_file(&blob, self.device_priv.as_ref(), Some(&self.pass_kek), &ctx)?;
-        serde_json::from_slice(&json)
-            .map_err(|e| CryptoError::InvalidFormat(format!("parse manifest: {e}")))
+        let manifest: Manifest = serde_json::from_slice(&json)
+            .map_err(|e| CryptoError::InvalidFormat(format!("parse manifest: {e}")))?;
+
+        // QV2-01: an encrypted manifest can still carry attacker-chosen data, so
+        // validate every ID and name at parse time - not only on UI actions.
+        for entry in &manifest.files {
+            paths::validate_file_id(&entry.id)
+                .map_err(|_| CryptoError::InvalidFormat("manifest contains an invalid file id".into()))?;
+            paths::validate_relative(&entry.name)
+                .map_err(|_| CryptoError::InvalidFormat("manifest contains an unsafe file name".into()))?;
+        }
+        Ok(manifest)
     }
 
     fn save_manifest(&self, manifest: &Manifest) -> Result<()> {
@@ -200,8 +224,11 @@ impl Session {
         write_atomic(&self.path.join(MANIFEST_FILENAME), &blob)
     }
 
-    fn file_path(&self, id: &str) -> PathBuf {
-        self.path.join(format!("{id}.{FILE_EXT}"))
+    /// Resolve the on-disk blob path for `id`, validating the ID first
+    /// (QV2-01). No caller can bypass the grammar check.
+    fn file_path(&self, id: &str) -> Result<PathBuf> {
+        paths::validate_file_id(id)?;
+        Ok(self.path.join(format!("{id}.{FILE_EXT}")))
     }
 }
 
@@ -271,7 +298,7 @@ fn guess_mime(name: &str) -> String {
 mod tests {
     use super::*;
 
-    const PASS: &[u8] = b"session passphrase here";
+    const PASS: &[u8] = b"tundra velvet orbit lamplight";
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("qvault-session-{name}-{}", std::process::id()))
@@ -373,6 +400,51 @@ mod tests {
         session.save_manifest(&manifest).unwrap();
 
         assert!(session.extract_file(&e.id).is_err());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn crafted_file_ids_are_rejected() {
+        // QV2-01 regression: an encrypted manifest can carry attacker-chosen
+        // IDs, so they must be validated at parse time and before disk use.
+        let path = temp("crafted-id");
+        let _ = std::fs::remove_dir_all(&path);
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        let e = session.add_file("real.txt", b"payload").unwrap();
+
+        // Direct IPC-style call with a traversal ID.
+        assert!(session.extract_file("../../etc/passwd").is_err());
+        assert!(session.delete_file("../../etc/passwd").is_err());
+        assert!(session.rename_file("../x", "y.txt").is_err());
+
+        // A manifest whose entry carries a traversal ID is rejected on load.
+        let mut manifest = session.load_manifest().unwrap();
+        manifest.get_mut(&e.id).unwrap().id = "../../evil".to_string();
+        session.save_manifest(&manifest).unwrap();
+        assert!(session.list_files().is_err(), "manifest with bad id must not load");
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn delete_unknown_id_leaves_state_unchanged() {
+        // QV2-01/QV2-04: an unknown ID must not mutate manifest or disk.
+        let path = temp("del-unknown");
+        let _ = std::fs::remove_dir_all(&path);
+        let vault = Vault::create(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        let e = session.add_file("keep.txt", b"keep").unwrap();
+        let unknown = "0".repeat(32);
+        assert!(session.delete_file(&unknown).is_err());
+
+        let files = session.list_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, e.id);
+        assert!(session.extract_file(&e.id).is_ok());
 
         let _ = std::fs::remove_dir_all(&path);
     }
