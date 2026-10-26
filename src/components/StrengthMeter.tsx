@@ -1,26 +1,34 @@
-import { useEffect, useState } from "react";
-import { api } from "../lib/api";
-
 /**
- * A 4-segment passphrase strength meter backed by the Rust KDF's strength check.
+ * A 4-segment passphrase strength meter.
+ *
+ * Presentational: the authoritative verdict comes from the backend
+ * (`crypto::kdf::strength_problem`) via the `usePassphraseStrength` hook, so
+ * the meter and the backend can never disagree about what is acceptable.
  */
-export function StrengthMeter({ passphrase }: { passphrase: string }) {
-  const [problem, setProblem] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (passphrase.length === 0) {
-      setProblem(null);
-      return;
-    }
-    const t = setTimeout(() => {
-      api.passphraseStrength(passphrase).then(setProblem).catch(() => setProblem(null));
-    }, 150);
-    return () => clearTimeout(t);
-  }, [passphrase]);
-
-  // Heuristic segment fill by length.
-  const segments = passphrase.length === 0 ? 0 : passphrase.length < 8 ? 1 : passphrase.length < 12 ? 2 : passphrase.length < 16 ? 3 : 4;
-  const strong = passphrase.length >= 12 && problem === null;
+export function StrengthMeter({
+  passphrase,
+  problem,
+  ok,
+}: {
+  passphrase: string;
+  /** The backend's rejection reason, or `null` when the passphrase is accepted. */
+  problem: string | null;
+  /** True when the backend accepts this passphrase. */
+  ok: boolean;
+}) {
+  // Heuristic segment fill by length; a passphrase the backend accepts is
+  // always shown as full strength.
+  const words = passphrase.split(" ").filter((w) => w.length > 0).length;
+  const segments =
+    passphrase.length === 0
+      ? 0
+      : ok
+        ? 4
+        : passphrase.length < 8 && words < 4
+          ? 1
+          : passphrase.length < 12 && words < 4
+            ? 2
+            : 3;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -30,9 +38,9 @@ export function StrengthMeter({ passphrase }: { passphrase: string }) {
             key={i}
             className={`h-1 flex-1 rounded-full transition-colors duration-300 ${
               i < segments
-                ? strong
+                ? ok
                   ? "bg-accent"
-                  : passphrase.length >= 8
+                  : segments >= 3
                     ? "bg-warning"
                     : "bg-danger"
                 : "bg-line"
@@ -41,8 +49,8 @@ export function StrengthMeter({ passphrase }: { passphrase: string }) {
         ))}
       </div>
       {passphrase.length > 0 && (
-        <p className={`text-xs ${strong ? "text-accent" : "text-ink-faint"}`}>
-          {strong ? "Strong passphrase" : problem ?? "Keep going…"}
+        <p className={`text-xs ${ok ? "text-accent" : "text-ink-faint"}`}>
+          {ok ? "Strong passphrase" : problem ?? "Keep going…"}
         </p>
       )}
     </div>

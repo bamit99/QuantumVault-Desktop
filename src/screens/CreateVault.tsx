@@ -6,6 +6,7 @@ import { Button } from "../components/Button";
 import { Field, Input } from "../components/Field";
 import { StrengthMeter } from "../components/StrengthMeter";
 import { api } from "../lib/api";
+import { usePassphraseStrength } from "../lib/strength";
 
 export function CreateVault({
   onDone,
@@ -21,6 +22,9 @@ export function CreateVault({
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // The backend policy is authoritative: 12+ characters *or* a 4-word
+  // passphrase, and no common word / low-variety string.
+  const strength = usePassphraseStrength(passphrase);
 
   async function pickFolder() {
     const selected = await open({ directory: true, title: "Choose a cloud folder" });
@@ -31,7 +35,7 @@ export function CreateVault({
   const canCreate =
     name.trim().length > 0 &&
     parent.length > 0 &&
-    passphrase.length >= 12 &&
+    strength.ok &&
     !mismatch &&
     !busy;
 
@@ -101,7 +105,11 @@ export function CreateVault({
             </button>
           </Field>
 
-          <Field label="Passphrase" id="pass" hint="At least 12 characters">
+          <Field
+            label="Passphrase"
+            id="pass"
+            hint="At least 12 characters, or a 4-word passphrase"
+          >
             <Input
               id="pass"
               type={show ? "text" : "password"}
@@ -118,7 +126,11 @@ export function CreateVault({
             </button>
           </Field>
 
-          <StrengthMeter passphrase={passphrase} />
+          <StrengthMeter
+            passphrase={passphrase}
+            problem={strength.problem}
+            ok={strength.ok}
+          />
 
           <Field label="Confirm passphrase" id="confirm" error={mismatch ? "Passphrases don't match" : undefined}>
             <Input

@@ -169,7 +169,7 @@ about Linux-only transitive crates do not mask anything in the actual binary.
 `cargo tree -i <crate> --target x86_64-pc-windows-msvc`, which prints nothing
 when the crate is not in the Windows graph.
 
-`src/robustness.rs` provides deterministic fuzz-style tests (seeded RNG, no
+`src-tauri/src/robustness.rs` provides deterministic fuzz-style tests (seeded RNG, no
 nightly required): random and mutated blobs through the parser, random strings
 through the path validators, and a containment check on random extraction names.
 Coverage-guided fuzzing with `cargo-fuzz` remains recommended as a further step.
