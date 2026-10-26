@@ -38,8 +38,19 @@ pub const META_VERSION: u32 = 4;
 /// The previous metadata version, still readable so an existing vault can be
 /// migrated to sidecars on first open.
 pub const META_VERSION_LEGACY: u32 = 3;
+/// The original metadata version, written by v0.1.0 and v0.1.1.
+///
+/// A v1 vault has no `vault_id`, its passphrase verifier is a plain
+/// `AES-GCM(Argon2id(passphrase), "qvault-passphrase-verifier-v1")` with no
+/// metadata digest and no AAD, its device key blob is the bare 96-byte
+/// private key, and its file blobs use the legacy v2 container (no AAD).
+/// All of that is still readable; such a vault is migrated to the current
+/// format on first open.
+pub const META_VERSION_V1: u32 = 1;
 /// Constant authenticated inside the verifier to confirm a correct passphrase.
 pub(crate) const VERIFIER_PLAINTEXT: &[u8] = b"qvault-passphrase-verifier-v2";
+/// The v1 verifier constant (v1 vaults have no metadata digest).
+pub(crate) const VERIFIER_PLAINTEXT_V1: &[u8] = b"qvault-passphrase-verifier-v1";
 /// Combined raw private length: X25519 scalar (32) + ML-KEM seed (64).
 const SEALED_PRIV_LEN: usize = 32 + 64;
 
@@ -49,6 +60,10 @@ pub struct VaultMeta {
     pub format: String,
     pub version: u32,
     /// Random per-vault identifier (hex). Binds blobs to this vault via AAD.
+    ///
+    /// Empty for a v1 vault, which predates the identifier; the migration
+    /// assigns one and persists it before it touches any file.
+    #[serde(default)]
     pub vault_id: String,
     /// ML-KEM-768 public key (base64).
     pub mlkem_pub_b64: String,
@@ -81,6 +96,17 @@ impl VaultMeta {
     pub fn unseal_device_keys(&self) -> Option<kem::VaultPrivate> {
         let sealed = decode_b64(&self.sealed_priv_b64).ok()?;
         let raw = dpapi::unseal(&sealed).ok()?;
+
+        // v1 vaults sealed the bare private key; every later version prefixes
+        // it with the AAD that binds it to this vault.
+        if raw.len() == SEALED_PRIV_LEN {
+            let x25519: [u8; 32] = raw[..32].try_into().ok()?;
+            let mlkem = raw[32..].to_vec();
+            return Some(kem::VaultPrivate {
+                mlkem: zeroize::Zeroizing::new(mlkem),
+                x25519: zeroize::Zeroizing::new(x25519),
+            });
+        }
 
         // Verify the AAD prefix binds this blob to this vault.
         let aad = format::vault_key_aad(&self.vault_id);
@@ -126,6 +152,20 @@ impl VaultMeta {
         let salt = decode_b64(&self.verify_salt_b64)?;
         let verifier = decode_b64(&self.verifier_b64)?;
         let pass_kek = kdf::derive(passphrase, &salt)?;
+
+        // A v1 vault used a plain verifier: a fixed label, no metadata digest
+        // and no AAD. The derived key is the same (same salt), so every file
+        // in the vault stays readable.
+        if self.version <= META_VERSION_V1 {
+            let plain = aead::decrypt(&pass_kek, &verifier, &[])?;
+            if plain != VERIFIER_PLAINTEXT_V1 {
+                return Err(CryptoError::Other(
+                    "legacy passphrase verifier is malformed".into(),
+                ));
+            }
+            return Ok(pass_kek);
+        }
+
         let aad = format::verifier_aad(&self.vault_id);
         // GCM auth failure means a wrong passphrase (or wrong vault binding).
         let payload = aead::decrypt(&pass_kek, &verifier, &aad)?;
@@ -242,7 +282,7 @@ impl Vault {
         let meta_path = path.join(META_FILENAME);
         let json = std::fs::read_to_string(&meta_path)
             .map_err(|e| CryptoError::Other(format!("read vault.meta: {e}")))?;
-        let meta: VaultMeta = serde_json::from_str(&json)
+        let mut meta: VaultMeta = serde_json::from_str(&json)
             .map_err(|e| CryptoError::InvalidFormat(format!("parse vault.meta: {e}")))?;
 
         if meta.format != META_FORMAT {
@@ -251,13 +291,17 @@ impl Vault {
                 meta.format
             )));
         }
-        if meta.version != META_VERSION && meta.version != META_VERSION_LEGACY {
+        if meta.version != META_VERSION
+            && meta.version != META_VERSION_LEGACY
+            && meta.version != META_VERSION_V1
+        {
             return Err(CryptoError::InvalidFormat(format!(
                 "unsupported vault metadata {} v{}",
                 meta.format, meta.version
             )));
         }
-        if meta.vault_id.is_empty() {
+        // A v1 vault has no vault ID yet; the migration assigns one.
+        if meta.version > META_VERSION_V1 && meta.vault_id.is_empty() {
             return Err(CryptoError::InvalidFormat(
                 "vault.meta has no vault ID".into(),
             ));
@@ -282,6 +326,13 @@ impl Vault {
             }
         }
 
+        // A vault written by v0.1.0/v0.1.1 is migrated to the current format
+        // before it is handed out, so the rest of the app only ever sees the
+        // current layout.
+        if meta.version == META_VERSION_V1 {
+            migrate_v1_vault(path, &mut meta, &vault_pub, device_priv.as_ref(), &pass_kek)?;
+        }
+
         Ok(Vault {
             path: path.to_path_buf(),
             vault_id: meta.vault_id.clone(),
@@ -304,6 +355,160 @@ impl Vault {
         meta.verifier_b64 = STANDARD.encode(&verifier);
         Ok(())
     }
+}
+
+/// Migrate a v1 vault (written by v0.1.0/v0.1.1) to the current format.
+///
+/// A v1 vault differs from the current one in three ways: it has no vault ID,
+/// its file blobs use the legacy v2 container (no AAD), and its file metadata
+/// lives in one shared `manifest.qvault` index instead of per-file sidecars.
+///
+/// The migration is ordered so that an interruption is always recoverable:
+///
+/// 1. **Assign and persist a vault ID.** The migrated blobs are bound to it
+///    by AAD, so a retry has to reuse the same one. The v1 verifier does not
+///    cover the metadata, so the passphrase keeps working.
+/// 2. **Re-encrypt every payload** from the legacy container into the
+///    AAD-bound one, and write a metadata sidecar for each file. A file that
+///    is already migrated is detected by its version byte and left alone, so
+///    the step is idempotent.
+/// 3. **Bump `vault.meta`** to the current version and recompute the
+///    passphrase verifier over the new metadata digest (same salt, so the
+///    same passphrase still derives the same key).
+/// 4. **Remove the legacy index**, which is redundant once the sidecars
+///    exist.
+///
+/// The version bump happens last, so a vault that claims the current version
+/// always has its sidecars — never the other way round.
+fn migrate_v1_vault(
+    path: &Path,
+    meta: &mut VaultMeta,
+    vault_pub: &kem::VaultPublic,
+    device_priv: Option<&kem::VaultPrivate>,
+    pass_kek: &[u8; 32],
+) -> Result<()> {
+    // Step 1: a vault ID is required by the AAD context.
+    if meta.vault_id.is_empty() {
+        meta.vault_id = hex(&crate::crypto::random::<16>()?);
+    }
+    let vault_id = meta.vault_id.clone();
+
+    // Re-seal the device key with the vault-ID prefix so the device leg keeps
+    // working after the migration. If the key is not available on this
+    // machine the legacy sealed blob is kept: it still decrypts the files
+    // through the passphrase leg.
+    if let Some(privk) = device_priv {
+        let mut raw = format::vault_key_aad(&vault_id);
+        raw.extend_from_slice(&privk.x25519[..]);
+        raw.extend_from_slice(&privk.mlkem[..]);
+        meta.sealed_priv_b64 = STANDARD.encode(dpapi::seal(&raw)?);
+    }
+
+    // Persist the vault ID *before* touching any file, so an interrupted
+    // migration retries against the same ID.
+    write_meta(path, meta)?;
+
+    // Step 2: read the legacy shared index.
+    let legacy_index = path.join(MANIFEST_FILENAME);
+    let entries: Vec<crate::manifest::FileEntry> = if legacy_index.exists() {
+        let blob = std::fs::read(&legacy_index)
+            .map_err(|e| CryptoError::Other(format!("read legacy manifest: {e}")))?;
+        // The legacy index is itself a legacy blob: no AAD.
+        let plain = format::decrypt_file(
+            &blob,
+            device_priv,
+            Some(pass_kek),
+            &format::BlobContext {
+                vault_id: &vault_id,
+                file_id: format::MANIFEST_CONTEXT,
+            },
+        )?;
+        let legacy: crate::manifest::Manifest = serde_json::from_slice(&plain)
+            .map_err(|e| CryptoError::InvalidFormat(format!("parse legacy manifest: {e}")))?;
+        legacy.files
+    } else {
+        Vec::new()
+    };
+
+    if entries.is_empty() {
+        // No index and no names to recover: the vault holds no recoverable
+        // file metadata, so refuse to claim it is migrated.
+        let has_blobs = std::fs::read_dir(path)
+            .map(|d| {
+                d.flatten().any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.ends_with(".qvault"))
+                })
+            })
+            .unwrap_or(false);
+        if has_blobs {
+            return Err(CryptoError::Other(
+                "this vault was created by v0.1.0/v0.1.1 and its file index is missing, so the \
+                 original file names cannot be recovered. The encrypted files are untouched."
+                    .into(),
+            ));
+        }
+    }
+
+    for entry in &entries {
+        // Decrypted metadata is untrusted input: validate the ID and the name.
+        entry.validate(&entry.id)?;
+
+        let ctx = format::BlobContext {
+            vault_id: &vault_id,
+            file_id: &entry.id,
+        };
+
+        // Re-encrypt the payload from the legacy container if needed.
+        let blob_path = crate::manifest::blob_path(path, &entry.id)?;
+        if blob_path.exists() {
+            let blob = std::fs::read(&blob_path)
+                .map_err(|e| CryptoError::Other(format!("read encrypted file: {e}")))?;
+            let version = format::blob_version(&blob)?;
+            if version == format::VERSION_LEGACY {
+                // If a single file cannot be re-encrypted (a damaged blob, a
+                // transient I/O error) the file keeps its legacy container and
+                // stays readable: the legacy container is still decryptable,
+                // it is just not AAD-bound to this vault. The migration
+                // continues so that one bad file cannot lock the user out of
+                // the whole vault.
+                match format::decrypt_file(&blob, device_priv, Some(pass_kek), &ctx)
+                    .and_then(|plain| format::encrypt_file(&plain, vault_pub, pass_kek, &ctx))
+                {
+                    Ok(migrated) => write_atomic(&blob_path, &migrated)?,
+                    Err(_) => { /* keep the legacy blob; the file still works */ }
+                }
+            } else {
+                // Already migrated: it must still open with the current
+                // context, otherwise the vault ID does not match.
+                format::decrypt_file(&blob, device_priv, Some(pass_kek), &ctx)?;
+            }
+        }
+
+        // Write the metadata sidecar for this file.
+        let plain = crate::manifest::encode_entry(entry)?;
+        let sidecar = format::encrypt_meta(&plain, vault_pub, pass_kek, &ctx)?;
+        write_atomic(&crate::manifest::sidecar_path(path, &entry.id)?, &sidecar)?;
+    }
+
+    // Step 3: claim the current version and recompute the verifier over the
+    // new metadata digest.
+    meta.version = META_VERSION;
+    Vault::refresh_verifier(meta, pass_kek)?;
+    write_meta(path, meta)?;
+
+    // Step 4: the shared index is now redundant.
+    let _ = std::fs::remove_file(&legacy_index);
+
+    Ok(())
+}
+
+/// Serialize `meta` and write it to `path` atomically.
+fn write_meta(path: &Path, meta: &VaultMeta) -> Result<()> {
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| CryptoError::Other(format!("serialize meta: {e}")))?;
+    write_atomic(&path.join(META_FILENAME), json.as_bytes())
 }
 
 /// Enforce the backend passphrase policy (QV-09).
@@ -574,6 +779,140 @@ mod tests {
         m3.x25519_pub_b64 = STANDARD.encode([9u8; 32]);
         assert_ne!(base, m3.metadata_digest());
 
+        clean(&path);
+    }
+
+    // ───────────────────── v1 (v0.1.0/v0.1.1) compatibility ─────────────────────
+
+    #[test]
+    fn v1_vault_opens_and_is_migrated() {
+        // A vault written by v0.1.0/v0.1.1 has no `vault_id` and uses the
+        // legacy blob container. It must open and be migrated forward.
+        let path = temp_vault_path("v1-migrate");
+        clean(&path);
+
+        let id_a = crate::legacy_fixture::random_id();
+        let id_b = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(
+            &path,
+            PASS,
+            &[
+                (&id_a, "report.pdf", b"legacy payload one"),
+                (&id_b, "notes.txt", b"legacy payload two"),
+            ],
+        );
+
+        // The vault opens with the same passphrase.
+        let v = Vault::open(&path, PASS).unwrap();
+        assert!(!v.vault_id.is_empty(), "migration must assign a vault ID");
+        assert_eq!(v.meta_version, META_VERSION, "vault must be upgraded");
+
+        // The metadata on disk is now the current format.
+        let meta: VaultMeta =
+            serde_json::from_str(&std::fs::read_to_string(path.join(META_FILENAME)).unwrap())
+                .unwrap();
+        assert_eq!(meta.version, META_VERSION);
+        assert_eq!(meta.vault_id, v.vault_id);
+
+        // Every payload was re-encrypted into the AAD-bound container, and
+        // the shared index is gone.
+        for id in [&id_a, &id_b] {
+            let blob = std::fs::read(path.join(format!("{id}.qvault"))).unwrap();
+            assert_eq!(format::blob_version(&blob).unwrap(), format::VERSION);
+            assert!(path.join(format!("{id}.meta")).exists(), "sidecar missing");
+        }
+        assert!(!path.join(MANIFEST_FILENAME).exists());
+
+        clean(&path);
+    }
+
+    #[test]
+    fn v1_vault_rejects_wrong_passphrase() {
+        let path = temp_vault_path("v1-wrongpass");
+        clean(&path);
+        let id = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(&path, PASS, &[(id.as_str(), "a.txt", b"secret")]);
+
+        assert!(matches!(
+            Vault::open(&path, b"the wrong passphrase"),
+            Err(CryptoError::AuthenticationFailed)
+        ));
+        clean(&path);
+    }
+
+    #[test]
+    fn v1_migration_is_idempotent() {
+        // Opening an already-migrated vault must not fail or change anything.
+        let path = temp_vault_path("v1-idempotent");
+        clean(&path);
+        let id = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(&path, PASS, &[(id.as_str(), "a.txt", b"secret")]);
+
+        let first = Vault::open(&path, PASS).unwrap();
+        let meta_after_first = std::fs::read_to_string(path.join(META_FILENAME)).unwrap();
+
+        let second = Vault::open(&path, PASS).unwrap();
+        assert_eq!(first.vault_id, second.vault_id, "vault ID must be stable");
+        assert_eq!(
+            meta_after_first,
+            std::fs::read_to_string(path.join(META_FILENAME)).unwrap(),
+            "a second open must not rewrite the metadata"
+        );
+        clean(&path);
+    }
+
+    #[test]
+    fn v1_migration_resumes_after_interruption() {
+        // Simulate a crash between "the vault ID was persisted" and "the
+        // payloads were re-encrypted": the retry must reuse the same ID and
+        // finish the job.
+        let path = temp_vault_path("v1-resume");
+        clean(&path);
+        let id = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(&path, PASS, &[(id.as_str(), "a.txt", b"payload")]);
+
+        // Persist a vault ID by hand, as the first migration step would.
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.join(META_FILENAME)).unwrap())
+                .unwrap();
+        let vault_id = crate::legacy_fixture::random_id();
+        meta["vault_id"] = serde_json::Value::String(vault_id.clone());
+        std::fs::write(
+            path.join(META_FILENAME),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        // The interrupted migration is completed by the next open.
+        let v = Vault::open(&path, PASS).unwrap();
+        assert_eq!(
+            v.vault_id, vault_id,
+            "the persisted vault ID must be reused"
+        );
+        assert_eq!(v.meta_version, META_VERSION);
+        clean(&path);
+    }
+
+    #[test]
+    fn v1_vault_without_index_is_reported() {
+        // No index means the original file names are gone. The vault must
+        // fail with a clear message instead of claiming an empty vault.
+        let path = temp_vault_path("v1-noindex");
+        clean(&path);
+        let id = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(&path, PASS, &[(id.as_str(), "a.txt", b"payload")]);
+        std::fs::remove_file(path.join(MANIFEST_FILENAME)).unwrap();
+
+        let err = match Vault::open(&path, PASS) {
+            Ok(_) => panic!("a v1 vault without an index must not open"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("file index is missing"),
+            "unexpected error: {err}"
+        );
+        // The encrypted file is left untouched.
+        assert!(path.join(format!("{id}.qvault")).exists());
         clean(&path);
     }
 

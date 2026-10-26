@@ -29,6 +29,19 @@ use super::kem::{self, VaultPrivate, VaultPublic};
 pub const MAGIC: &[u8; 6] = b"QVAULT";
 /// Current format version (v3 = AAD-bound).
 pub const VERSION: u8 = 3;
+/// The original blob version, written by v0.1.0 and v0.1.1.
+///
+/// v2 blobs are structurally identical to v3 but carry **no AAD**: every
+/// AEAD operation used an empty associated-data value. They are still
+/// readable — the container, the key wrap and the payload layer are the same
+/// primitives — and are re-encrypted into the AAD-bound v3 form when a legacy
+/// vault is migrated (see [`crate::session`]).
+///
+/// Dispatching on the version byte is safe: the AAD of a v3 blob contains the
+/// constant `VERSION`, and a v2 blob was sealed with an empty AAD, so
+/// flipping a header byte only makes decryption fail — it cannot downgrade a
+/// blob to a weaker context.
+pub const VERSION_LEGACY: u8 = 2;
 
 /// AAD domain-separation label.
 const AAD_LABEL: &[u8] = b"QVAULT-AAD-v1";
@@ -129,10 +142,23 @@ pub fn encrypt_file(
         plaintext,
         vault_pub,
         pass_kek,
-        ctx,
-        PURPOSE_KEYWRAP,
-        PURPOSE_PAYLOAD,
+        &build_aad(PURPOSE_KEYWRAP, ctx),
+        &build_aad(PURPOSE_PAYLOAD, ctx),
+        VERSION,
     )
+}
+
+/// Encrypt `plaintext` into a **legacy v2** QVAULT blob (no AAD).
+///
+/// Only used to build v1-format fixtures and to write legacy blobs; new
+/// content is always written with [`encrypt_file`].
+#[cfg(test)]
+pub(crate) fn encrypt_file_legacy(
+    plaintext: &[u8],
+    vault_pub: &VaultPublic,
+    pass_kek: &[u8; KEK_LEN],
+) -> Result<Vec<u8>> {
+    encrypt_blob(plaintext, vault_pub, pass_kek, &[], &[], VERSION_LEGACY)
 }
 
 /// Encrypt `plaintext` into a QVAULT **metadata sidecar** blob (QV3-01).
@@ -150,46 +176,43 @@ pub fn encrypt_meta(
         plaintext,
         vault_pub,
         pass_kek,
-        ctx,
-        PURPOSE_META_KEYWRAP,
-        PURPOSE_META_PAYLOAD,
+        &build_aad(PURPOSE_META_KEYWRAP, ctx),
+        &build_aad(PURPOSE_META_PAYLOAD, ctx),
+        VERSION,
     )
 }
 
 /// Shared blob construction: fresh file key → AES-GCM payload → dual key wrap.
 ///
-/// The two AAD purposes are parameters rather than constants so that file
-/// blobs and metadata sidecars share one implementation while remaining
-/// cryptographically distinct.
+/// The AADs and the version byte are parameters rather than constants so
+/// that file blobs, metadata sidecars and the legacy v2 container can share
+/// one implementation while remaining cryptographically distinct.
 fn encrypt_blob(
     plaintext: &[u8],
     vault_pub: &VaultPublic,
     pass_kek: &[u8; KEK_LEN],
-    ctx: &BlobContext<'_>,
-    keywrap_purpose: &[u8],
-    payload_purpose: &[u8],
+    keywrap_aad: &[u8],
+    payload_aad: &[u8],
+    version: u8,
 ) -> Result<Vec<u8>> {
-    let keywrap_aad = build_aad(keywrap_purpose, ctx);
-    let payload_aad = build_aad(payload_purpose, ctx);
-
     // 1. Fresh per-blob key.
     let file_key = zeroize::Zeroizing::new(super::random::<FILE_KEY_LEN>()?);
 
     // 2. AES-GCM the payload (AAD-bound).
-    let payload = aead::encrypt(&file_key, plaintext, &payload_aad)?;
+    let payload = aead::encrypt(&file_key, plaintext, payload_aad)?;
 
     // 3. Device leg: hybrid KEM → KEK → wrap FileKey.
     let encap = kem::encapsulate(vault_pub)?;
     let device_kek = &encap.kek;
-    let wrapped_device = aead::encrypt(device_kek, &*file_key, &keywrap_aad)?;
+    let wrapped_device = aead::encrypt(device_kek, &*file_key, keywrap_aad)?;
 
     // 4. Passphrase leg: wrap FileKey with the session passphrase KEK.
-    let wrapped_pass = aead::encrypt(pass_kek, &*file_key, &keywrap_aad)?;
+    let wrapped_pass = aead::encrypt(pass_kek, &*file_key, keywrap_aad)?;
 
     // 5. Assemble.
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(MAGIC);
-    out.push(VERSION);
+    out.push(version);
     out.extend_from_slice(&encap.eph_pub);
     out.extend_from_slice(&encap.ct);
     out.extend_from_slice(&encap.salt);
@@ -209,14 +232,19 @@ pub fn decrypt_file(
     pass_kek: Option<&[u8; KEK_LEN]>,
     ctx: &BlobContext<'_>,
 ) -> Result<Vec<u8>> {
-    decrypt_blob(
-        blob,
-        device_priv,
-        pass_kek,
-        ctx,
-        PURPOSE_KEYWRAP,
-        PURPOSE_PAYLOAD,
-    )
+    let fields = parse(blob)?;
+    match fields.version {
+        VERSION => decrypt_blob(
+            &fields,
+            device_priv,
+            pass_kek,
+            &build_aad(PURPOSE_KEYWRAP, ctx),
+            &build_aad(PURPOSE_PAYLOAD, ctx),
+        ),
+        // Legacy v2 container: same primitives, no associated data.
+        VERSION_LEGACY => decrypt_blob(&fields, device_priv, pass_kek, &[], &[]),
+        v => Err(CryptoError::UnsupportedVersion(v)),
+    }
 }
 
 /// Decrypt a QVAULT **metadata sidecar** blob (QV3-01).
@@ -229,53 +257,52 @@ pub fn decrypt_meta(
     pass_kek: Option<&[u8; KEK_LEN]>,
     ctx: &BlobContext<'_>,
 ) -> Result<Vec<u8>> {
+    let fields = parse(blob)?;
+    // Sidecars only exist in the AAD-bound format.
+    if fields.version != VERSION {
+        return Err(CryptoError::UnsupportedVersion(fields.version));
+    }
     decrypt_blob(
-        blob,
+        &fields,
         device_priv,
         pass_kek,
-        ctx,
-        PURPOSE_META_KEYWRAP,
-        PURPOSE_META_PAYLOAD,
+        &build_aad(PURPOSE_META_KEYWRAP, ctx),
+        &build_aad(PURPOSE_META_PAYLOAD, ctx),
     )
 }
 
 /// Shared blob decryption: try the device leg, then the passphrase leg.
 fn decrypt_blob(
-    blob: &[u8],
+    fields: &Parsed,
     device_priv: Option<&VaultPrivate>,
     pass_kek: Option<&[u8; KEK_LEN]>,
-    ctx: &BlobContext<'_>,
-    keywrap_purpose: &[u8],
-    payload_purpose: &[u8],
+    keywrap_aad: &[u8],
+    payload_aad: &[u8],
 ) -> Result<Vec<u8>> {
-    let fields = parse(blob)?;
-    let keywrap_aad = build_aad(keywrap_purpose, ctx);
-    let payload_aad = build_aad(payload_purpose, ctx);
-
     // Leg 1: device keys.
     if let Some(privk) = device_priv
         && let Ok(kek) =
             kem::decapsulate(privk, &fields.eph_pub, &fields.encapsulation, &fields.salt)
-        && let Ok(fk) = aead::decrypt(&kek, &fields.wrapped_device, &keywrap_aad)
+        && let Ok(fk) = aead::decrypt(&kek, &fields.wrapped_device, keywrap_aad)
     {
         let file_key: [u8; FILE_KEY_LEN] = fk
             .try_into()
             .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
         let file_key = zeroize::Zeroizing::new(file_key);
-        if let Ok(pt) = aead::decrypt(&file_key, &fields.payload, &payload_aad) {
+        if let Ok(pt) = aead::decrypt(&file_key, &fields.payload, payload_aad) {
             return Ok(pt);
         }
     }
 
     // Leg 2: passphrase (cross-device recovery path).
     if let Some(pass_kek) = pass_kek
-        && let Ok(fk) = aead::decrypt(pass_kek, &fields.wrapped_pass, &keywrap_aad)
+        && let Ok(fk) = aead::decrypt(pass_kek, &fields.wrapped_pass, keywrap_aad)
     {
         let file_key: [u8; FILE_KEY_LEN] = fk
             .try_into()
             .map_err(|_| CryptoError::InvalidFormat("unwrapped FileKey length".into()))?;
         let file_key = zeroize::Zeroizing::new(file_key);
-        return aead::decrypt(&file_key, &fields.payload, &payload_aad);
+        return aead::decrypt(&file_key, &fields.payload, payload_aad);
     }
 
     Err(CryptoError::AuthenticationFailed)
@@ -283,6 +310,8 @@ fn decrypt_blob(
 
 /// Parsed header fields (payload excluded).
 struct Parsed {
+    /// Container version of this blob (`VERSION` or `VERSION_LEGACY`).
+    version: u8,
     eph_pub: [u8; kem::X25519_PUB_LEN],
     encapsulation: Vec<u8>,
     salt: [u8; kem::SALT_LEN],
@@ -296,7 +325,23 @@ pub fn has_magic(blob: &[u8]) -> bool {
     blob.len() >= MAGIC.len() && &blob[..MAGIC.len()] == MAGIC
 }
 
+/// The container version of a QVAULT blob.
+///
+/// Used to tell a legacy v2 blob (no AAD) from the current v3 one, so a
+/// migration knows which files still need re-encrypting.
+pub fn blob_version(blob: &[u8]) -> Result<u8> {
+    if !has_magic(blob) {
+        return Err(CryptoError::InvalidFormat("not a QVAULT blob".into()));
+    }
+    if blob.len() < MAGIC.len() + 1 {
+        return Err(CryptoError::InvalidFormat("blob too short".into()));
+    }
+    Ok(blob[MAGIC.len()])
+}
+
 /// Parse a QVAULT blob, validating structure and version.
+///
+/// Accepts the current version and the legacy v2 container.
 fn parse(blob: &[u8]) -> Result<Parsed> {
     if !has_magic(blob) {
         return Err(CryptoError::InvalidFormat("not a QVAULT blob".into()));
@@ -309,7 +354,7 @@ fn parse(blob: &[u8]) -> Result<Parsed> {
     let mut off = MAGIC.len();
     let version = blob[off];
     off += 1;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_LEGACY {
         return Err(CryptoError::UnsupportedVersion(version));
     }
 
@@ -339,6 +384,7 @@ fn parse(blob: &[u8]) -> Result<Parsed> {
     let payload = blob[off..].to_vec();
 
     Ok(Parsed {
+        version,
         eph_pub,
         encapsulation,
         salt,

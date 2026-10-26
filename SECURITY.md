@@ -120,6 +120,40 @@ device key and the verifier salt.
 - This check works on a fresh machine too: it relies on the passphrase, not on
   the device key.
 
+## Vault format versions & migration
+
+A vault's `vault.meta` carries a version number, and the app migrates older
+vaults forward on first open. The rule is always the same: **the version bump
+happens last**, so a vault that claims the current version is always fully
+migrated — never the other way round.
+
+| Version | Written by | Layout | Migration |
+|---|---|---|---|
+| 1 | v0.1.0, v0.1.1 | one shared `manifest.qvault` index, legacy v2 blobs (no AAD), no vault ID | re-encrypts every payload into the AAD-bound container, writes a sidecar per file, assigns a vault ID, re-seals the device key, then bumps to v4 |
+| 3 | v0.1.2, v0.1.3 | one shared `manifest.qvault` index, AAD-bound blobs | writes a sidecar per file, then bumps to v4 |
+| 4 | v0.2.0+ | per-file `.meta` sidecars, AAD-bound blobs | — |
+
+A version 1 vault is a special case: it predates the vault ID, its verifier is
+a plain `AES-GCM(Argon2id(passphrase), "qvault-passphrase-verifier-v1")` with no
+metadata digest, and its device key was sealed with DPAPI as the bare private
+key. All of that is still readable — the migration keeps the same Argon2 salt,
+so the same passphrase keeps deriving the same key and every file stays
+readable.
+
+The migration is **idempotent and crash-safe**:
+
+- the vault ID is persisted *before* any file is touched, so an interrupted
+  migration retries against the same ID (the migrated blobs are bound to it);
+- a payload that is already in the current container is detected by its version
+  byte and left alone;
+- if a single file cannot be re-encrypted (a damaged blob, a transient I/O
+  error), that file keeps its legacy container — it is still readable, it is
+  just not AAD-bound — and the migration continues, so one bad file cannot lock
+  the user out of the whole vault;
+- a vault whose shared index is missing cannot recover the original file names;
+  the app says so instead of presenting an empty vault, and leaves the
+  encrypted files untouched.
+
 ## Limits & known constraints
 
 | Area | Current behaviour |
@@ -155,7 +189,7 @@ Run before each release:
 
 ```bash
 cd src-tauri
-cargo test          # 83 tests
+cargo test          # 90 tests
 cargo clippy --all-targets
 cargo fmt --check
 cargo deny check    # advisories, licences, bans, sources

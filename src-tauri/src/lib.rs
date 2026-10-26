@@ -5,6 +5,8 @@
 
 mod crypto;
 mod folder_icon;
+#[cfg(test)]
+mod legacy_fixture;
 mod manifest;
 mod paths;
 mod registry;

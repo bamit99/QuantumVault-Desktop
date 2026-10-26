@@ -807,4 +807,68 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&path);
     }
+
+    // ───────────────────── v1 (v0.1.0/v0.1.1) compatibility ─────────────────────
+
+    #[test]
+    fn v1_vault_lists_and_extracts_after_migration() {
+        // The full user-visible path for a legacy vault: open it, list the
+        // files, extract them. The names come from the old shared index and
+        // must survive the migration.
+        let path = temp("v1-session");
+        let _ = std::fs::remove_dir_all(&path);
+
+        let id_a = crate::legacy_fixture::random_id();
+        let id_b = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(
+            &path,
+            PASS,
+            &[
+                (&id_a, "quarterly report.pdf", b"legacy payload one"),
+                (&id_b, "notes.txt", b"legacy payload two"),
+            ],
+        );
+
+        let vault = Vault::open(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        let files = session.list_files().unwrap();
+        assert_eq!(files.len(), 2, "both legacy files must be listed");
+        let names: std::collections::HashSet<&str> =
+            files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains("quarterly report.pdf"));
+        assert!(names.contains("notes.txt"));
+
+        // The contents are intact.
+        let (_, data) = session.extract_file(&id_a).unwrap();
+        assert_eq!(data.as_slice(), b"legacy payload one");
+        let (_, data) = session.extract_file(&id_b).unwrap();
+        assert_eq!(data.as_slice(), b"legacy payload two");
+
+        // A new file can be added to the migrated vault.
+        let added = session.add_file("new.txt", b"fresh").unwrap();
+        assert!(session.extract_file(&added.id).is_ok());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn v1_vault_rename_and_delete_work_after_migration() {
+        let path = temp("v1-mutate");
+        let _ = std::fs::remove_dir_all(&path);
+
+        let id = crate::legacy_fixture::random_id();
+        crate::legacy_fixture::build(&path, PASS, &[(id.as_str(), "old.txt", b"payload")]);
+
+        let vault = Vault::open(&path, PASS).unwrap();
+        let session = Session::new(vault);
+
+        session.rename_file(&id, "renamed.txt").unwrap();
+        assert_eq!(session.list_files().unwrap()[0].name, "renamed.txt");
+
+        session.delete_file(&id).unwrap();
+        assert!(session.list_files().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
