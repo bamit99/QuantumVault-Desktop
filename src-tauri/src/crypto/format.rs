@@ -66,6 +66,16 @@ const PURPOSE_PAYLOAD: &[u8] = b"payload";
 const PURPOSE_VERIFIER: &[u8] = b"verifier";
 const PURPOSE_VAULT_KEY: &[u8] = b"vault-key";
 
+/// AAD purpose tags for the per-file metadata sidecars (QV3-01).
+///
+/// These are deliberately distinct from the file purposes: a metadata sidecar
+/// and a file blob are otherwise the same wire format, so only the AAD
+/// purpose keeps the two apart. A sidecar can never be substituted for a file
+/// blob (or the reverse) — the payload layer *and* the key-wrap layer both
+/// fail to authenticate.
+const PURPOSE_META_KEYWRAP: &[u8] = b"meta-keywrap";
+const PURPOSE_META_PAYLOAD: &[u8] = b"meta-payload";
+
 /// Append a length-prefixed field (unambiguous encoding).
 fn push_field(buf: &mut Vec<u8>, field: &[u8]) {
     buf.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -115,10 +125,54 @@ pub fn encrypt_file(
     pass_kek: &[u8; KEK_LEN],
     ctx: &BlobContext<'_>,
 ) -> Result<Vec<u8>> {
-    let keywrap_aad = build_aad(PURPOSE_KEYWRAP, ctx);
-    let payload_aad = build_aad(PURPOSE_PAYLOAD, ctx);
+    encrypt_blob(
+        plaintext,
+        vault_pub,
+        pass_kek,
+        ctx,
+        PURPOSE_KEYWRAP,
+        PURPOSE_PAYLOAD,
+    )
+}
 
-    // 1. Fresh per-file key.
+/// Encrypt `plaintext` into a QVAULT **metadata sidecar** blob (QV3-01).
+///
+/// Same container as a file blob, but bound to the metadata AAD purposes, so a
+/// sidecar can never be substituted for a file blob (or the reverse): both the
+/// payload layer and the key-wrap layer fail to authenticate.
+pub fn encrypt_meta(
+    plaintext: &[u8],
+    vault_pub: &VaultPublic,
+    pass_kek: &[u8; KEK_LEN],
+    ctx: &BlobContext<'_>,
+) -> Result<Vec<u8>> {
+    encrypt_blob(
+        plaintext,
+        vault_pub,
+        pass_kek,
+        ctx,
+        PURPOSE_META_KEYWRAP,
+        PURPOSE_META_PAYLOAD,
+    )
+}
+
+/// Shared blob construction: fresh file key → AES-GCM payload → dual key wrap.
+///
+/// The two AAD purposes are parameters rather than constants so that file
+/// blobs and metadata sidecars share one implementation while remaining
+/// cryptographically distinct.
+fn encrypt_blob(
+    plaintext: &[u8],
+    vault_pub: &VaultPublic,
+    pass_kek: &[u8; KEK_LEN],
+    ctx: &BlobContext<'_>,
+    keywrap_purpose: &[u8],
+    payload_purpose: &[u8],
+) -> Result<Vec<u8>> {
+    let keywrap_aad = build_aad(keywrap_purpose, ctx);
+    let payload_aad = build_aad(payload_purpose, ctx);
+
+    // 1. Fresh per-blob key.
     let file_key = zeroize::Zeroizing::new(super::random::<FILE_KEY_LEN>()?);
 
     // 2. AES-GCM the payload (AAD-bound).
@@ -155,9 +209,48 @@ pub fn decrypt_file(
     pass_kek: Option<&[u8; KEK_LEN]>,
     ctx: &BlobContext<'_>,
 ) -> Result<Vec<u8>> {
+    decrypt_blob(
+        blob,
+        device_priv,
+        pass_kek,
+        ctx,
+        PURPOSE_KEYWRAP,
+        PURPOSE_PAYLOAD,
+    )
+}
+
+/// Decrypt a QVAULT **metadata sidecar** blob (QV3-01).
+///
+/// Uses the metadata AAD purposes, so a file blob presented here fails to
+/// authenticate and vice versa.
+pub fn decrypt_meta(
+    blob: &[u8],
+    device_priv: Option<&VaultPrivate>,
+    pass_kek: Option<&[u8; KEK_LEN]>,
+    ctx: &BlobContext<'_>,
+) -> Result<Vec<u8>> {
+    decrypt_blob(
+        blob,
+        device_priv,
+        pass_kek,
+        ctx,
+        PURPOSE_META_KEYWRAP,
+        PURPOSE_META_PAYLOAD,
+    )
+}
+
+/// Shared blob decryption: try the device leg, then the passphrase leg.
+fn decrypt_blob(
+    blob: &[u8],
+    device_priv: Option<&VaultPrivate>,
+    pass_kek: Option<&[u8; KEK_LEN]>,
+    ctx: &BlobContext<'_>,
+    keywrap_purpose: &[u8],
+    payload_purpose: &[u8],
+) -> Result<Vec<u8>> {
     let fields = parse(blob)?;
-    let keywrap_aad = build_aad(PURPOSE_KEYWRAP, ctx);
-    let payload_aad = build_aad(PURPOSE_PAYLOAD, ctx);
+    let keywrap_aad = build_aad(keywrap_purpose, ctx);
+    let payload_aad = build_aad(payload_purpose, ctx);
 
     // Leg 1: device keys.
     if let Some(privk) = device_priv

@@ -27,9 +27,19 @@ pub const META_FILENAME: &str = "vault.meta";
 pub const MANIFEST_FILENAME: &str = "manifest.qvault";
 
 const META_FORMAT: &str = "qvault-desktop";
-const META_VERSION: u32 = 3;
+/// Current vault metadata version.
+///
+/// v4 (QV3-01) moved file metadata from a single shared `manifest.qvault`
+/// index to per-file `.meta` sidecars. The version bump is what makes an
+/// *older* app fail loudly on a newer vault instead of silently showing an
+/// empty vault: v0.1.x looks for `manifest.qvault`, finds none, and would
+/// report zero files. Refusing to open is the safe outcome.
+pub const META_VERSION: u32 = 4;
+/// The previous metadata version, still readable so an existing vault can be
+/// migrated to sidecars on first open.
+pub const META_VERSION_LEGACY: u32 = 3;
 /// Constant authenticated inside the verifier to confirm a correct passphrase.
-const VERIFIER_PLAINTEXT: &[u8] = b"qvault-passphrase-verifier-v2";
+pub(crate) const VERIFIER_PLAINTEXT: &[u8] = b"qvault-passphrase-verifier-v2";
 /// Combined raw private length: X25519 scalar (32) + ML-KEM seed (64).
 const SEALED_PRIV_LEN: usize = 32 + 64;
 
@@ -148,6 +158,12 @@ pub struct Vault {
     pub device_priv: Option<kem::VaultPrivate>,
     /// Session passphrase KEK (derived once at unlock).
     pub pass_kek: [u8; 32],
+    /// The metadata version this vault was opened with (QV3-01).
+    ///
+    /// A vault written by v0.1.x reports [`META_VERSION_LEGACY`]; it is
+    /// migrated to sidecars and upgraded the first time the session touches
+    /// it.
+    pub meta_version: u32,
 }
 
 impl Vault {
@@ -217,6 +233,7 @@ impl Vault {
             vault_pub: pubk,
             device_priv: Some(privk),
             pass_kek,
+            meta_version: META_VERSION,
         })
     }
 
@@ -228,7 +245,13 @@ impl Vault {
         let meta: VaultMeta = serde_json::from_str(&json)
             .map_err(|e| CryptoError::InvalidFormat(format!("parse vault.meta: {e}")))?;
 
-        if meta.format != META_FORMAT || meta.version != META_VERSION {
+        if meta.format != META_FORMAT {
+            return Err(CryptoError::InvalidFormat(format!(
+                "unsupported vault metadata format {}",
+                meta.format
+            )));
+        }
+        if meta.version != META_VERSION && meta.version != META_VERSION_LEGACY {
             return Err(CryptoError::InvalidFormat(format!(
                 "unsupported vault metadata {} v{}",
                 meta.format, meta.version
@@ -265,7 +288,21 @@ impl Vault {
             vault_pub,
             device_priv,
             pass_kek,
+            meta_version: meta.version,
         })
+    }
+
+    /// Re-encrypt the passphrase verifier over the current metadata digest.
+    ///
+    /// Used after a metadata field changes (such as the QV3-01 version bump)
+    /// so the vault keeps opening with its own passphrase.
+    pub fn refresh_verifier(meta: &mut VaultMeta, pass_kek: &[u8; 32]) -> Result<()> {
+        let mut payload = Vec::with_capacity(VERIFIER_PLAINTEXT.len() + 32);
+        payload.extend_from_slice(VERIFIER_PLAINTEXT);
+        payload.extend_from_slice(&meta.metadata_digest());
+        let verifier = aead::encrypt(pass_kek, &payload, &format::verifier_aad(&meta.vault_id))?;
+        meta.verifier_b64 = STANDARD.encode(&verifier);
+        Ok(())
     }
 }
 
@@ -290,7 +327,14 @@ fn enforce_passphrase_policy(passphrase: &[u8]) -> Result<()> {
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
-    let tmp = path.with_extension("tmp-write");
+    // The temp name is the full file name plus a suffix, NOT a replaced
+    // extension: a vault holds `<id>.qvault` and `<id>.meta` side by side,
+    // and `with_extension` would give both the same temp path. (QV3-01)
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let tmp = path.with_file_name(format!("{file_name}.tmp-write"));
     {
         let mut f = std::fs::File::create(&tmp)
             .map_err(|e| CryptoError::Other(format!("create temp file: {e}")))?;

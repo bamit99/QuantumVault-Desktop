@@ -62,26 +62,31 @@ Every encryption operation is bound to an **AAD** derived from:
 - a domain-separation label,
 - the format version,
 - the **vault ID** (random per vault),
-- the **file ID** (opaque per file; `manifest` for the index).
+- the **file ID** (opaque per file).
+- a **purpose** tag, which distinguishes the payload blob from the metadata
+  sidecar that describes it.
 
 Consequences:
 
 - A blob **cannot** be copied into a different vault's folder and decrypted.
 - A blob **cannot** be swapped between two file IDs in the same vault.
-- A tampered or substituted manifest entry fails authentication.
+- A metadata sidecar **cannot** be substituted for a payload blob, or the
+  reverse: both the payload layer and the key-wrap layer fail to authenticate.
+- A tampered or substituted metadata sidecar fails authentication.
 
-The AAD context is not stored in the blob — it comes from the authenticated
-manifest and the vault metadata. That is exactly what makes substitution
-detectable.
+The AAD context is not stored in the blob — it comes from the file ID and the
+vault metadata. That is exactly what makes substitution detectable.
 
 ## Path safety
 
 Filenames and identifiers are validated in the **Rust backend**, never trusting
-the manifest (decrypted data is not trusted input):
+the decrypted metadata (decrypted data is not trusted input):
 
 - **File IDs** must be exactly 32 lowercase hex characters. The grammar is
-  enforced in the path helper itself, when parsing the manifest, and at every
-  IPC command — so a crafted ID cannot escape the vault directory.
+  enforced in the path helper itself, when parsing a metadata sidecar, and at
+  every IPC command — so a crafted ID cannot escape the vault directory.
+- A sidecar's ID must also **match the file it was read from**, so a sidecar
+  copied onto a different file is rejected.
 - **Single-file names** must be a plain basename (no separators, no drive/UNC
   prefixes, no `.`/`..`, no control characters, no trailing dot/space, no
   reserved device names).
@@ -89,9 +94,9 @@ the manifest (decrypted data is not trusted input):
 - **Extraction** re-validates the decrypted name, then walks the destination one
   component at a time, refusing any existing symlink or reparse point in the
   chain, and creates the file with `create_new` (no overwrite, no redirection).
-- **Deletion** requires the ID to exist in the manifest before either the
-  manifest or the disk is touched, and removes the blob before the manifest entry
-  so a failure leaves a recoverable reference rather than an orphan.
+- **Deletion** requires the file to exist before either the metadata or the
+  disk is touched, and removes the payload blob before the metadata sidecar so
+  a failure leaves a recoverable reference rather than an orphan.
 - Symlinks and junctions are **never followed** during folder encryption or
   vault discovery.
 
@@ -120,8 +125,8 @@ device key and the verifier salt.
 | Area | Current behaviour |
 |---|---|
 | File size | Files above **1 GiB** are rejected. Files are still processed whole in memory, so peak RSS can be several times the file size; the cap is an interim control until a chunked format exists |
-| Concurrency | Single-process; cloud-sync conflict resolution is not implemented |
-| Manifest | Written atomically (temp file → fsync → rename); blob+manifest updates are not one transaction, so a crash can leave orphaned blobs |
+| Concurrency | Single-process. Per-file metadata sidecars mean concurrent adds from two machines never touch the same file, so a concurrent add cannot lose another machine's files. A concurrent **rename or delete of the same file** is still last-writer-wins |
+| Metadata | Each file's metadata lives in its own encrypted sidecar (`<id>.meta`), written atomically (temp file → fsync → rename). A payload blob and its sidecar are not one transaction, so a crash between the two can leave a blob whose metadata is missing — the file is then invisible in the listing, but its bytes are still on disk |
 | Extraction | Refuses to overwrite an existing file; renames/creates are not transactional |
 | Zeroization | Private keys, file keys, KEKs, KEM IKM and plaintext are held in `Zeroizing` containers; compiler/allocator copies and crash dumps cannot be fully erased |
 | Rollback | A full-directory rollback by an attacker is not detectable without external trusted state |

@@ -12,7 +12,7 @@ the provider never sees anything readable.
 <p align="center">
   <a href="https://github.com/bamit99/QuantumVault-Desktop/releases/latest"><img src="https://img.shields.io/github/v/release/bamit99/QuantumVault-Desktop?label=release" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6" alt="Platform" />
-  <img src="https://img.shields.io/badge/tests-74%20passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-83%20passing-brightgreen" alt="Tests" />
 </p>
 
 <p align="center">
@@ -130,7 +130,7 @@ src-tauri/src/
 ├── crypto/        # aead (AES-GCM+AAD), kdf (Argon2id), kem (hybrid), format, dpapi
 ├── paths.rs       # filename/path validation, link detection
 ├── vault.rs       # vault lifecycle (create / open / unlock)
-├── manifest.rs    # encrypted file index
+├── manifest.rs    # per-file encrypted metadata sidecars
 ├── session.rs     # unlocked-session file operations
 ├── registry.rs    # persisted list of known vaults
 └── folder_icon.rs # desktop.ini custom folder icon
