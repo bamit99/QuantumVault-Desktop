@@ -12,7 +12,7 @@ the provider never sees anything readable.
 <p align="center">
   <a href="https://github.com/bamit99/QuantumVault-Desktop/releases/latest"><img src="https://img.shields.io/github/v/release/bamit99/QuantumVault-Desktop?label=release" alt="Latest release" /></a>
   <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6" alt="Platform" />
-  <img src="https://img.shields.io/badge/tests-57%20passing-brightgreen" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-74%20passing-brightgreen" alt="Tests" />
 </p>
 
 <p align="center">
