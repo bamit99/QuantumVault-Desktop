@@ -155,7 +155,7 @@ Run before each release:
 
 ```bash
 cd src-tauri
-cargo test          # 74 tests
+cargo test          # 83 tests
 cargo clippy --all-targets
 cargo fmt --check
 cargo deny check    # advisories, licences, bans, sources
