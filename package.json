@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:release": "cargo build --release --manifest-path src-tauri/Cargo.toml --features custom-protocol",
+    "smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-create-vault.ps1",
     "sign": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sign.ps1",
     "cert:new": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/New-SelfSignedCert.ps1",
     "cert:trust": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/Install-Certificate.ps1"

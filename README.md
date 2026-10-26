@@ -108,6 +108,12 @@ npm run tauri build      # produces the portable exe + NSIS and MSI installers
 npm run sign             # signs the portable exe (see SIGNING.md)
 ```
 
+> **Note:** a plain `cargo build --release` produces a *dev-mode* binary that
+> tries to load the Vite dev server (`http://localhost:1420`) and shows
+> "This page can't be displayed". Production builds must enable Tauri's
+> `custom-protocol` feature — `npm run tauri build` does this for you; for a
+> manual build use `npm run build:release`.
+
 Outputs:
 
 ```

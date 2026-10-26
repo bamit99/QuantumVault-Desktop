@@ -163,6 +163,23 @@ cargo audit
 npm audit
 ```
 
+A production build must enable Tauri's `custom-protocol` feature, otherwise the
+binary loads the dev server (`http://localhost:1420`) instead of the bundled
+frontend and shows "This page can't be displayed":
+
+```bash
+npm run tauri build          # shipping path (feature enabled automatically)
+npm run build:release        # manual cargo build (feature enabled explicitly)
+```
+
+After building, launch the app and run the UI smoke test — it asserts that the
+Create Vault button is enabled exactly when the backend passphrase policy
+accepts the passphrase:
+
+```bash
+npm run smoke
+```
+
 `cargo deny` is scoped to the shipped Windows target (`deny.toml`), so warnings
 about Linux-only transitive crates do not mask anything in the actual binary.
 `cargo audit` may still report Linux-only crates (D-Bus/`rfd`); confirm with

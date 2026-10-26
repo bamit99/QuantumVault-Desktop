@@ -18,6 +18,16 @@ edition = "2024"
 name = "quantum_vault_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# This feature is used for production builds or when a dev server is not
+# specified, DO NOT REMOVE!!
+# Without it the binary is built in "dev" mode and loads the Vite dev server
+# (http://localhost:1420) instead of the bundled frontend, which shows
+# "This page can't be displayed" in the packaged app.
+# `tauri build` enables it automatically; for a manual build use:
+#   cargo build --release --features custom-protocol
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
