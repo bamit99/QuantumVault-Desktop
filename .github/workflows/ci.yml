@@ -88,6 +88,7 @@ jobs:
 
       - name: Verify README test badge matches the source
         shell: bash
+        working-directory: .
         run: |
           badge=$(sed -n 's/.*tests-\([0-9]*\)%20passing.*/\1/p' README.md | head -1)
           actual=$(grep -rc "#\[test\]" src-tauri/src --include='*.rs' | awk -F: '{s+=$2} END {print s}')
