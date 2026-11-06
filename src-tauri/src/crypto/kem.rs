@@ -22,7 +22,14 @@ use zeroize::Zeroizing;
 
 use super::error::{CryptoError, Result};
 
-/// HKDF domain-separation info (matches Android).
+/// HKDF domain-separation info: Desktop's own label `qvault-pq-hybrid-v1`.
+///
+/// Intentionally NOT the mobile dialect's label (`aiguru-pq-hybrid-v1`, used by
+/// both Android and iOS): Desktop writes a separate "compatible-features"
+/// container dialect, so the domain-separation strings differ too. Byte-level
+/// compatibility with the mobile apps is not implemented (see PLAN.md).
+/// Do not change this value: it feeds the KEK derivation, so altering it would
+/// make every existing Desktop vault unreadable.
 const HKDF_INFO: &[u8] = b"qvault-pq-hybrid-v1";
 
 /// Length of the X25519 public key / shared secret (bytes).
