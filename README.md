@@ -160,6 +160,17 @@ The released binaries are signed with a self-signed certificate. See
 Get-AuthenticodeSignature .\quantum-vault-desktop.exe | Format-List Status, SignerCertificate
 ```
 
+## Related projects
+
+- **[Quantum-Vault](https://github.com/bamit99/Quantum-Vault)** — the Android app (Kotlin).
+- **[Quantum-Vault-iOS](https://github.com/bamit99/Quantum-Vault-iOS)** — the iOS app (Swift/CryptoKit).
+
+> **Format dialects:** the two mobile apps share a byte-compatible QVAULT v1/v2
+> container dialect, so vaults move between them. Desktop uses its own
+> *compatible-features* dialect — same crypto primitives (ML-KEM-768 + X25519,
+> Argon2id, AES-256-GCM), different container layout; byte-compatibility with
+> the mobile apps is a stretch goal, not implemented (see [PLAN.md](PLAN.md)).
+
 ## Author
 
 Built by [Amit Bhatnagar](https://www.linkedin.com/in/amitxbhatnagar/).

@@ -30,8 +30,9 @@ Amit Bhatnagar — https://www.linkedin.com/in/amitxbhatnagar/
 
 ## 3. Redistribution & Modification
 
-- You may **not** redistribute the application, its APK, or modified versions
-  without this license notice and without prior permission for anything beyond
+- You may **not** redistribute the application (including its executables,
+  installers, and MSI packages), or modified versions, without this license
+  notice and without prior permission for anything beyond
   personal use by the recipient.
 - You may **not** remove or alter this license notice, the About screen credits,
   or the copyright statement.
@@ -61,4 +62,4 @@ and the passphrase are lost.
 ---
 
 *Quantum Vault — post-quantum encrypted file vault.*
-*X25519 + ML-KEM-768 (FIPS 203) hybrid · Argon2id passphrase binding · SAF storage*
+*X25519 + ML-KEM-768 (FIPS 203) hybrid · Argon2id passphrase binding · local & cloud-synced storage*
